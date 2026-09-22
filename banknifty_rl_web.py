@@ -50,6 +50,11 @@ CKPT_DIR.mkdir(parents=True, exist_ok=True)
 MULTI_SEED_OFFSETS = (0, 17, 41)
 
 TRAIN_DEFAULTS = dict(
+    algorithm="ppo",
+    dqn_buffer_size=50000, dqn_learning_starts=10000,
+    dqn_train_freq=4, dqn_gradient_steps=1, dqn_target_update_interval=2000,
+    dqn_tau=1.0, dqn_exploration_fraction=0.30,
+    dqn_initial_epsilon=1.0, dqn_final_epsilon=0.05, dqn_double_enabled=True,
     total_timesteps=1000000, learning_rate=0.0003, n_steps=2048, batch_size=512, n_epochs=5,
     gamma=0.995, gae_lambda=0.95, clip_range=0.20, ent_coef=0.01, vf_coef=0.5,
     max_grad_norm=0.5, seed=42,
@@ -60,6 +65,8 @@ TRAIN_DEFAULTS = dict(
     target_kl_enabled=True, target_kl=0.03,
     tensorboard_enabled=True, benchmark_reference_enabled=False,
     target_win_rate_pct=70.0, target_profit_factor=1.5, target_average_r=0.0,
+    daily_targets_enabled=False, target_daily_points=40.0,
+    target_daily_hit_rate_pct=100.0, max_daily_loss_points=20.0,
     min_validation_trades=50, min_trades_per_day=0.0,
     pi_layer1=512, pi_layer2=256, pi_layer3=128,
     vf_layer1=512, vf_layer2=256, vf_layer3=128,
@@ -88,6 +95,8 @@ def summarize_trades(trades, days=0):
     return dict(
         total_trades=len(trades),
         total_trading_days=days,
+        net_option_points=sum(points),
+        average_daily_points=sum(points)/days if days else 0.0,
         trades_per_day=len(trades)/days if days else 0,
         ce_trades=sum(t["side"] == "CE" for t in trades),
         pe_trades=sum(t["side"] == "PE" for t in trades),
@@ -160,8 +169,16 @@ def validation_target_results(metrics, training_cfg=None, complete=True):
         profit_factor=pf is not None and np.isfinite(pf) and pf >= float(cfg.get("target_profit_factor", 1.5)),
         average_r=float(metrics.get("average_R", 0)) >= float(cfg.get("target_average_r", 0)),
     )
+    daily = metrics.get("daily_net_points", [])
+    target_points = float(cfg.get("target_daily_points", 40.0))
+    hit_rate = 100 * sum(p >= target_points for p in daily) / len(daily) if daily else 0.0
+    if cfg.get("daily_targets_enabled", False):
+        checks["daily_profit_target"] = bool(daily) and hit_rate >= float(cfg.get("target_daily_hit_rate_pct", 100.0))
+        checks["daily_loss_budget"] = bool(daily) and min(daily) >= -float(cfg.get("max_daily_loss_points", 20.0))
     return dict(checks=checks, targets_met=bool(all(checks.values())),
                 minimum_trades=int(cfg.get("min_validation_trades", 50)),
+                daily_target_hit_rate_pct=hit_rate,
+                daily_target_points=target_points,
                 trade_frequency=frequency)
 
 
@@ -186,6 +203,13 @@ def validation_selection_score(metrics, training_cfg=None):
     score -= 0.004*max(0.0, target_wr-wr)
     score -= 0.12*max(0.0, target_pf-pf)
     score -= 0.50*max(0.0, target_r-avg_r)
+    if training_cfg.get("daily_targets_enabled", False):
+        daily = metrics.get("daily_net_points", [])
+        target_points = float(training_cfg.get("target_daily_points", 40.0))
+        hit_rate = 100 * sum(p >= target_points for p in daily) / len(daily) if daily else 0.0
+        score -= 0.01 * max(0.0, float(training_cfg.get("target_daily_hit_rate_pct", 100.0)) - hit_rate)
+        if daily:
+            score -= 0.01 * max(0.0, -min(daily) - float(training_cfg.get("max_daily_loss_points", 20.0)))
     minimum = max(1, int(training_cfg.get("min_validation_trades", 50)))
     if n < minimum:
         score -= (minimum-n)/minimum
@@ -309,6 +333,8 @@ class State:
     def snapshot(self):
         with self.lock:
             metrics = summarize_trades(self.all_trades, self.day_episodes)
+            if self.evaluation and self.status in ("completed", "stopped"):
+                metrics.update(self.evaluation.get("trading_metrics", {}))
             total_actions = sum(self.action_counts.values())
             rates = {
                 k: 100*v/total_actions if total_actions else 0
@@ -404,10 +430,10 @@ def check_training_stop():
 def save_training_model(model, env, cfg, run_id, seed):
     """Publish the archive last so the picker only sees complete bundles."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    model_path = MODEL_DIR / f"banknifty_ppo_{stamp}.zip"
+    model_path = MODEL_DIR / f"banknifty_{cfg['algorithm']}_{stamp}.zip"
     vec_path = MODEL_DIR / f"vecnormalize_{stamp}.pkl"
     metadata = dict(
-        environment_version=ENV_VERSION, environment=cfg["environment"],
+        algorithm=cfg["algorithm"], environment_version=ENV_VERSION, environment=cfg["environment"],
         training={k: v for k, v in cfg.items() if k != "environment"},
         selected_seed=seed, model_id=run_id, timesteps=int(model.num_timesteps),
         normalization_file=vec_path.name, validation_status="not_validated",
@@ -437,6 +463,19 @@ def maskable_ppo_class():
             "running this app: python -m pip install sb3-contrib"
         ) from exc
     return MaskablePPO
+
+
+def load_trading_model(path, device="cpu"):
+    """Use the saved algorithm, never the current form, to load model weights."""
+    with zipfile.ZipFile(path) as archive:
+        metadata = json.loads(archive.read("data"))
+    algorithm = metadata.get("market_algorithm", "ppo")
+    if algorithm == "dqn":
+        from banknifty_dqn import BankNiftyDQN
+        return BankNiftyDQN.load(path, device=device)
+    if algorithm == "ppo":
+        return maskable_ppo_class().load(path, device=device)
+    raise ValueError(f"Unsupported saved algorithm: {algorithm}")
 
 
 parse_env_config = validate_config
@@ -500,7 +539,10 @@ class LiveCallback(BaseCallback):
         return not stop
 
     def _on_rollout_start(self):
-        self._capture_optimizer()
+        # DQN rollouts may be only four steps. Avoid logging/locking every rollout.
+        if self.num_timesteps - getattr(self, "_last_capture", -256) >= 256:
+            self._capture_optimizer()
+            self._last_capture = self.num_timesteps
 
     def _on_training_end(self):
         self._capture_optimizer()
@@ -520,6 +562,10 @@ def _policy_action(model, vec, raw_env, obs):
     normalized = vec.normalize_obs(obs)
     masks = raw_env.action_masks()
     action, _ = model.predict(normalized, deterministic=True, action_masks=masks)
+    if getattr(model, "market_algorithm", "ppo") == "dqn":
+        # Q-values are expected returns, not calibrated action probabilities.
+        raw_env.set_action_probability(None)
+        return int(action)
     with th.no_grad():
         tensor, _ = model.policy.obs_to_tensor(normalized)
         distribution = model.policy.get_distribution(tensor, action_masks=masks)
@@ -542,7 +588,7 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
     )
 
     if not reference_only:
-        model = maskable_ppo_class().load(model_path, device="cpu")
+        model = load_trading_model(model_path, device="cpu")
         if (getattr(model, "market_dataset_id", None) != raw_env.dataset_id
                 or getattr(model, "market_feature_columns", None) != raw_env.feature_columns):
             raw_env.close()
@@ -552,6 +598,7 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
         vec.norm_reward = False
 
     all_trades = []
+    daily_results = []
     candidate_days = []
     finished_days = 0
     if state is not None and progress:
@@ -599,6 +646,11 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
             if diag:
                 candidate_days.append(diag)
             finished_days += 1
+            daily_results.append(dict(date=str(raw_env.current_day),
+                                      net_points=raw_env._daily_net_points(),
+                                      net_rupees=raw_env._daily_net_points() * raw_env.trade_quantity,
+                                      trades=len(raw_env.trade_log),
+                                      limit_reason=raw_env.daily_limit_reason))
 
             if state is not None:
                 state.episode(raw_env.episode_reward)
@@ -608,6 +660,13 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
                         state.progress = round(100*finished_days/len(raw_env.days), 2)
 
         metrics = summarize_trades(all_trades, finished_days)
+        daily_points = [d["net_points"] for d in daily_results]
+        metrics.update(daily_net_points=daily_points,
+                       worst_day_points=min(daily_points) if daily_points else None,
+                       best_day_points=max(daily_points) if daily_points else None,
+                       profitable_days_pct=100 * sum(p > 0 for p in daily_points) / len(daily_points) if daily_points else 0.0,
+                       average_daily_rupees=metrics["average_daily_points"] * raw_env.trade_quantity,
+                       daily_results=daily_results)
         return dict(
             trades=all_trades,
             metrics=metrics,
@@ -638,10 +697,10 @@ def training_worker(cfg):
     """Save each seed before validation, then publish the validation winner."""
     current_env = None
     try:
-        MaskablePPO = maskable_ppo_class()
+        algorithm = cfg["algorithm"]
         _, data_meta = load_dataset(OBS, MANIFEST, OPT_DIR)
         device = training_device(cfg)
-        root_id = "momentum_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        root_id = algorithm + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         STATE.begin_log(root_id)
 
         base_seed = int(cfg["seed"])
@@ -651,14 +710,18 @@ def training_worker(cfg):
             seeds = [base_seed]
 
         # Split the requested budget among seeds, aligned to complete rollouts.
-        raw_each = max(cfg["n_steps"], cfg["total_timesteps"] // len(seeds))
-        per_seed = max(cfg["n_steps"], (raw_each // cfg["n_steps"]) * cfg["n_steps"])
+        rollout = cfg["dqn_train_freq"] if algorithm == "dqn" else cfg["n_steps"]
+        raw_each = max(rollout, cfg["total_timesteps"] // len(seeds))
+        per_seed = max(rollout, (raw_each // rollout) * rollout)
+        if algorithm == "dqn" and per_seed <= cfg["dqn_learning_starts"]:
+            raise ValueError("DQN steps per seed must exceed dqn_learning_starts")
         total_actual = per_seed * len(seeds)
 
         with STATE.lock:
             STATE.target = total_actual
             STATE.steps = 0
             STATE.evaluation = {
+                "algorithm": algorithm,
                 "multi_seed": cfg["multi_seed_enabled"],
                 "seeds": seeds,
                 "steps_per_seed": per_seed,
@@ -675,9 +738,13 @@ def training_worker(cfg):
             run_id = f"{root_id}_seed{seed}"
 
             def make_env():
-                return Monitor(make_market_env(
+                env = make_market_env(
                     cfg["environment"], state=STATE, model_id=run_id
-                ))
+                )
+                if algorithm == "dqn":
+                    from banknifty_dqn import NextActionMask
+                    env = NextActionMask(env)
+                return Monitor(env)
 
             current_env = DummyVecEnv([make_env])
             current_env = VecNormalize(
@@ -689,26 +756,32 @@ def training_worker(cfg):
                 STATE.device = device
                 STATE.gpu = th.cuda.get_device_name(cfg["cuda_device"]) if cfg["cuda_enabled"] else "CPU"
 
-            model = MaskablePPO(
-                "MlpPolicy", current_env,
-                learning_rate=cfg["learning_rate"],
-                n_steps=cfg["n_steps"],
-                batch_size=cfg["batch_size"],
-                n_epochs=cfg["n_epochs"],
-                gamma=cfg["gamma"], gae_lambda=cfg["gae_lambda"], clip_range=cfg["clip_range"],
-                ent_coef=cfg["ent_coef"], vf_coef=cfg["vf_coef"], max_grad_norm=cfg["max_grad_norm"],
-                target_kl=cfg["target_kl"] if cfg["target_kl_enabled"] else None,
-                policy_kwargs=dict(
-                    activation_fn=th.nn.ReLU,
-                    net_arch=dict(
-                        pi=[cfg["pi_layer1"], cfg["pi_layer2"], cfg["pi_layer3"]],
-                        vf=[cfg["vf_layer1"], cfg["vf_layer2"], cfg["vf_layer3"]]
-                    )
-                ),
-                device=device, verbose=1, seed=seed,
-                tensorboard_log=str(MODEL_DIR / "tensorboard") if cfg["tensorboard_enabled"] else None,
-            )
+            if algorithm == "dqn":
+                from banknifty_dqn import build_dqn
+                model = build_dqn(current_env, cfg, device, seed,
+                                  str(MODEL_DIR / "tensorboard") if cfg["tensorboard_enabled"] else None)
+            else:
+                model = maskable_ppo_class()(
+                    "MlpPolicy", current_env,
+                    learning_rate=cfg["learning_rate"],
+                    n_steps=cfg["n_steps"],
+                    batch_size=cfg["batch_size"],
+                    n_epochs=cfg["n_epochs"],
+                    gamma=cfg["gamma"], gae_lambda=cfg["gae_lambda"], clip_range=cfg["clip_range"],
+                    ent_coef=cfg["ent_coef"], vf_coef=cfg["vf_coef"], max_grad_norm=cfg["max_grad_norm"],
+                    target_kl=cfg["target_kl"] if cfg["target_kl_enabled"] else None,
+                    policy_kwargs=dict(
+                        activation_fn=th.nn.ReLU,
+                        net_arch=dict(
+                            pi=[cfg["pi_layer1"], cfg["pi_layer2"], cfg["pi_layer3"]],
+                            vf=[cfg["vf_layer1"], cfg["vf_layer2"], cfg["vf_layer3"]]
+                        )
+                    ),
+                    device=device, verbose=1, seed=seed,
+                    tensorboard_log=str(MODEL_DIR / "tensorboard") if cfg["tensorboard_enabled"] else None,
+                )
 
+            model.market_algorithm = algorithm
             model.market_env_config = dict(cfg["environment"])
             model.market_dataset_id = data_meta["dataset_id"]
             with STATE.lock:
@@ -810,7 +883,7 @@ def training_worker(cfg):
 
         check_training_stop()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        final_model = MODEL_DIR / f"banknifty_ppo_{stamp}.zip"
+        final_model = MODEL_DIR / f"banknifty_{algorithm}_{stamp}.zip"
         final_vec = MODEL_DIR / f"vecnormalize_{stamp}.pkl"
         with STATE.lock:
             STATE.status = "stopping" if STATE.stop else "saving"
@@ -818,6 +891,7 @@ def training_worker(cfg):
         meta_path = final_model.with_suffix(".json")
         staged_meta = meta_path.with_suffix(".json.tmp")
         staged_meta.write_text(json.dumps({
+            "algorithm": algorithm,
             "validation_status": "completed",
             "environment_version": ENV_VERSION,
             "dataset_id": data_meta["dataset_id"],
@@ -896,9 +970,10 @@ def model_files(name):
     if not model_path.is_file():
         raise ValueError("Saved model not found")
     stem = model_path.stem
-    if not stem.startswith("banknifty_ppo_"):
+    prefix = next((p for p in ("banknifty_ppo_", "banknifty_dqn_") if stem.startswith(p)), None)
+    if prefix is None:
         raise ValueError("Unsupported model filename")
-    vec_path = MODEL_DIR / (stem.replace("banknifty_ppo_", "vecnormalize_", 1) + ".pkl")
+    vec_path = MODEL_DIR / (stem.replace(prefix, "vecnormalize_", 1) + ".pkl")
     if not vec_path.is_file():
         raise ValueError("Matching normalization statistics are missing")
 
@@ -918,7 +993,7 @@ def model_files(name):
 
 def validation_worker(model_path, vec_path, split, override):
     try:
-        model = maskable_ppo_class().load(model_path, device="cpu")
+        model = load_trading_model(model_path, device="cpu")
         saved = getattr(model, "market_env_config", None)
         if saved is None or getattr(model, "market_env_version", None) != ENV_VERSION:
             raise ValueError(
@@ -933,6 +1008,7 @@ def validation_worker(model_path, vec_path, split, override):
             EVAL_STATE.target = 1
             EVAL_STATE.device = "cpu"
             EVAL_STATE.evaluation = dict(
+                algorithm=getattr(model, "market_algorithm", "ppo"),
                 split=split, model=model_path.name,
                 environment=env_cfg,
                 settings_source="current form" if override is not None else "saved training settings",
@@ -1009,7 +1085,7 @@ app = Flask(__name__)
 
 HTML = r"""
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BANKNIFTY Autonomous PPO</title><style>
+<title>BANKNIFTY Autonomous PPO / DQN</title><style>
 body{font-family:Segoe UI,Arial;background:#0d1117;color:#e6edf3;margin:0}.w{width:min(1500px,96vw);margin:22px auto}
 .p{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:15px;margin-bottom:14px}
 .g,.c{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.m{background:#1d2430;padding:12px;border-radius:9px;border:1px solid #30363d}
@@ -1020,7 +1096,7 @@ button{padding:10px 14px;border:0;border-radius:6px;font-weight:700;cursor:point
 .muted{color:#8b949e}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:8px;border-bottom:1px solid #30363d;text-align:left}.sc{max-height:430px;overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere}
 @media(max-width:1000px){.g,.c{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:600px){.g,.c{grid-template-columns:1fr}}
 </style></head><body><div class="w">
-<h2>BANKNIFTY Autonomous PPO</h2><p class="muted">PPO chooses WAIT / BUY CE / BUY PE when flat and HOLD / EXIT while invested. Indicators advise the policy. Entry gates and forced exits are optional controls. Defaults retain emergency protection and end-of-day square-off.</p>
+<h2>BANKNIFTY Autonomous PPO / DQN</h2><p class="muted">Select PPO or DQN below. The policy chooses WAIT / BUY CE / BUY PE when flat and HOLD / EXIT while invested. Indicators advise the policy. Both algorithms respect action masks. Entry gates and forced exits are optional controls.</p>
 <div class="p"><button onclick="loadDataStatus()">CHECK PREPARED DATA</button><pre id="dataStatus">Checking prepared dataset...</pre></div>
 <details class="p"><summary>Optional supervised / candidate research tools (entry selection only)</summary>
 <p><button onclick="applyCandidateDefaults()">CANDIDATE DEFAULTS</button> <button onclick="candidateJob('build')">1. BUILD CANDIDATE DATASET</button> <button class="start" onclick="candidateJob('supervised')">2. TRAIN SUPERVISED</button> <button class="start" onclick="candidateJob('ppo')">3. TRAIN CANDIDATE PPO</button> <button class="stop" onclick="stopCandidateJob()">STOP CANDIDATE JOB</button></p>
@@ -1040,7 +1116,7 @@ button{padding:10px 14px;border:0;border-radius:6px;font-weight:700;cursor:point
 <p id="settingsmessage" class="muted" role="status">Save training and trading settings as JSON, or choose a saved file to restore the form. Loading does not change a running job.</p>
 <p class="muted">Use AUTONOMOUS DEFAULTS for independent entries and learned exits. A missing quote prevents a fill; missing indicators are represented by zero plus availability flags. Validation targets rank models and do not guarantee results. Test is never used for automatic selection.</p>
 <p class="muted">Stop premium is a fraction (0.10 = 10%). ATR protection, overtrade penalties and the entry-quality gate are optional. Quantity is a simulation assumption: configure it for the contracts being evaluated. Dynamic slippage and full simulated charges can be enabled/disabled. Verify statutory/broker-specific charge rates before live use.</p>
-<button onclick="entryExplorationPreset()">AUTONOMOUS DEFAULTS</button> <button onclick="start()">START PPO TRAINING</button> <button class="stop" onclick="stop()">STOP AND SAVE</button><p id="presetnote" class="muted"></p></div>
+<button onclick="entryExplorationPreset()">AUTONOMOUS DEFAULTS</button> <button onclick="start()">START TRAINING</button> <button class="stop" onclick="stop()">STOP AND SAVE</button><p id="presetnote" class="muted"></p></div>
 <div class="p"><b id="status">idle</b> <span id="steps"></span><br><br><div class="bar"><div id="fill" class="fill"></div></div><p id="runinfo" class="muted"></p></div>
 <div class="g" id="trainmetrics"></div><br>
 <div class="p"><h3>Learning progress</h3><p class="muted">Last 500 training episodes: grey = net reward including enabled shaping, green = rolling mean of 20. Training results include repeated historical days; use validation/test to assess performance. Optimizer statistics update after PPO updates. CUDA accelerates the neural network; market replay remains on CPU.</p><svg id="learningCurve" viewBox="0 0 700 160" style="width:100%;height:160px" role="img" aria-label="Episode reward and rolling mean"></svg><pre id="optimizerStats"></pre></div>
@@ -1062,7 +1138,7 @@ const labels={min_hold_minutes:'Minimum hold (completed bars)',reentry_cooldown_
 Object.assign(labels,{reference_strategy_enabled:'Enable reference strategy + PPO',reference_score_gate_enabled:'Enable reference-score gate',reference_window:'Ignition lookback (bars)',reference_ignition_min:'Minimum ignition score (0–1)',reference_direction_gap:'Minimum directional score gap',reference_signal_ttl_enabled:'Enable signal TTL',reference_signal_ttl_minutes:'Signal validity (minutes)',reference_exit_threshold:'Momentum decay score threshold',reference_target_underlying_points:'Base BANKNIFTY target points',reference_strike_window:'OI window (strikes each side)',reference_strike_spacing:'Strike spacing (index points)',reference_structural_lookback:'Structural stop lookback (bars)',reference_pivot_left:'Pivot confirmation bars left',reference_pivot_right:'Pivot confirmation bars right',reference_structural_buffer_fraction:'Structural stop candle-range buffer fraction',learned_exit_enabled:'Enable PPO learned EXIT',risk_reward_target_enabled:'Enable R-multiple take profit',risk_reward_target_r:'Take-profit R multiple',momentum_gate_enabled:'Enable directional momentum gate',path_efficiency_gate_enabled:'Enable path-efficiency gate',atr_expansion_gate_enabled:'Enable ATR-expansion gate',extension_gate_enabled:'Enable extension/exhaustion gate',trend_alignment_gate_enabled:'Enable EMA trend alignment',price_oi_gate_enabled:'Enable price×OI directional gate',option_liquidity_gate_enabled:'Enable option liquidity gate',option_delta_gate_enabled:'Enable option delta gate',regime_filter_enabled:'Enable regime filter',dynamic_slippage_enabled:'Enable dynamic slippage',transaction_costs_enabled:'Enable transaction costs',structural_stop_enabled:'Enable structural stop',momentum_decay_exit_enabled:'Enable momentum-decay exit',underlying_target_enabled:'Enable underlying target',volatility_target_enabled:'Enable ATR-normalized target',emergency_stop_enabled:'Enable emergency option stop',min_stop_enabled:'Enable minimum-point stop',premium_stop_enabled:'Enable premium-% stop',use_atr_stop:'Enable ATR stop',min_hold_enabled:'Enable minimum hold',cooldown_enabled:'Enable re-entry cooldown',max_hold_enabled:'Enable maximum hold',square_off_enabled:'Enable square-off',entry_penalty_enabled:'Enable entry penalty',overtrading_penalty_enabled:'Enable overtrade penalty',hold_shaping_enabled:'Enable HOLD shaping',giveback_penalty_enabled:'Enable giveback penalty',terminal_win_shaping_enabled:'Enable terminal win bonus',terminal_loss_shaping_enabled:'Enable terminal loss penalty',first_entry_time_enabled:'Enable first-entry time',last_entry_time_enabled:'Enable last-entry cutoff'});
 const ints=new Set(['atr_period','min_hold_minutes','reentry_cooldown_minutes','max_hold_minutes','free_trades_per_day','trade_quantity','reference_window','reference_signal_ttl_minutes','reference_strike_window','reference_structural_lookback','reference_pivot_left','reference_pivot_right','num_seeds','seed_stride','n_steps','batch_size','n_epochs','seed','checkpoint_freq','pi_layer1','pi_layer2','pi_layer3','vf_layer1','vf_layer2','vf_layer3','total_timesteps']);
 function humanize(k){return k.replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase())}
-function renderFields(parentId,prefix,obj,labelMap={}){const parent=document.getElementById(parentId);for(const [key,value] of Object.entries(obj)){const box=document.createElement('div'),label=document.createElement('label'),input=document.createElement('input');box.dataset.setting=key;label.textContent=labelMap[key]||humanize(key);label.htmlFor=prefix+key;input.id=prefix+key;input.type=typeof value==='boolean'?'checkbox':typeof value==='string'?(key==='disabled_features'?'text':'time'):'number';if(input.type==='checkbox')input.checked=value;else input.value=value;if(input.type==='number'){input.min='0';input.step=ints.has(key)?'1':'any'}box.append(label,input);parent.append(box)}}
+function renderFields(parentId,prefix,obj,labelMap={}){const parent=document.getElementById(parentId);for(const [key,value] of Object.entries(obj)){const box=document.createElement('div'),label=document.createElement('label'),input=document.createElement(key==='algorithm'?'select':'input');box.dataset.setting=key;label.textContent=labelMap[key]||humanize(key);label.htmlFor=prefix+key;input.id=prefix+key;if(key==='algorithm'){input.add(new Option('Maskable PPO','ppo'));input.add(new Option('Masked DQN / Double DQN','dqn'));input.value=value}else{input.type=typeof value==='boolean'?'checkbox':typeof value==='string'?(key.endsWith('_time')?'time':'text'):'number';if(input.type==='checkbox')input.checked=value;else input.value=value;if(input.type==='number'){input.min='0';input.step=ints.has(key)?'1':'any'}}box.append(label,input);parent.append(box)}}
 Object.assign(labels,{
 path_efficiency_window:'Path-efficiency window (completed bars)',
 terminal_win_min_points:'Minimum net option points for win bonus (after costs)',
@@ -1108,16 +1184,20 @@ momentum_decay_loss_penalty_r:'Losing momentum-decay extra penalty R'
 });
 ints.add('path_efficiency_window');ints.add('min_validation_trades');['target_exit_cooldown_minutes','structural_stop_cooldown_minutes','losing_exit_cooldown_minutes'].forEach(k=>ints.add(k));
 Object.assign(labels,{reference_strategy_enabled:'Restrict entries to reference signals (OFF = PPO chooses both sides)',reference_features_enabled:'Include advisory reference calculations',missing_filter_values_pass:'Optional liquidity/indicator gates permit missing values',missingness_features_enabled:'Show indicator availability flags',disabled_features:'Disabled feature names (comma separated)',nse_option_txn_rate:'Exchange fee rate (turnover fraction)',option_stt_sell_rate:'STT sell rate (turnover fraction)'});
+Object.assign(labels,{daily_profit_limit_enabled:'Stop entries after daily profit target',daily_profit_target_points:'Daily NET profit target (option points)',daily_loss_limit_enabled:'Stop entries after daily loss budget',daily_loss_limit_points:'Daily NET loss budget (positive option points)',close_on_daily_limit_enabled:'Include open P&L and request exit on daily limit (next available open)'});
 renderFields('envfields','cfg_',defaults,labels);
 const trainLabels={target_win_rate_pct:'Validation target win rate %',target_profit_factor:'Validation target profit factor',target_average_r:'Validation target average R',multi_seed_enabled:'Enable multi-seed training',num_seeds:'Number of seeds',seed_stride:'Seed stride',normalize_obs_enabled:'Normalize observations',normalize_reward_enabled:'Normalize rewards',cuda_enabled:'Enable CUDA',checkpoint_enabled:'Enable checkpoints'};
 trainLabels.min_validation_trades='Minimum validation trades for target assessment';
 trainLabels.min_trades_per_day='Minimum average validation trades/day (0 = disabled)';
 Object.assign(trainLabels,{cuda_enabled:'Require CUDA for training (OFF = CPU)',cuda_device:'CUDA GPU index',cuda_tf32_enabled:'Allow TF32 CUDA matrix multiplication',cpu_threads:'PyTorch CPU threads',benchmark_reference_enabled:'Also evaluate deterministic reference benchmark',target_kl_enabled:'Enable KL early stopping per PPO update',tensorboard_enabled:'Write TensorBoard learning logs'});
 ['cuda_device','cpu_threads'].forEach(k=>ints.add(k));
+Object.assign(trainLabels,{daily_targets_enabled:'Require daily objectives in validation assessment',target_daily_points:'Validation daily NET points target',target_daily_hit_rate_pct:'Required % of evaluated days meeting daily target',max_daily_loss_points:'Validation maximum daily loss budget (positive points)'});
+['dqn_buffer_size','dqn_learning_starts','dqn_train_freq','dqn_gradient_steps','dqn_target_update_interval'].forEach(k=>ints.add(k));
+Object.assign(trainLabels,{algorithm:'Training algorithm',dqn_double_enabled:'DQN: use Double DQN targets',dqn_buffer_size:'DQN: replay capacity (transitions, uses RAM)',dqn_learning_starts:'DQN: valid-action warmup steps',dqn_train_freq:'DQN: collect steps per update',dqn_gradient_steps:'DQN: gradient updates per collection',dqn_target_update_interval:'DQN: target network update interval (steps)',dqn_tau:'DQN: target update fraction',dqn_exploration_fraction:'DQN: fraction of run for epsilon decay',dqn_initial_epsilon:'DQN: initial random-action probability',dqn_final_epsilon:'DQN: final random-action probability'});
 renderFields('trainfields','tr_',trainDefaults,trainLabels);
 document.getElementById('tr_target_average_r').removeAttribute('min');
 const tuningHelp=document.createElement('p');tuningHelp.className='muted';
-tuningHelp.textContent='CUDA mode checks a real GPU operation and policy placement; unavailable CUDA raises an error. Total steps are shared across seeds when multi-seed is enabled. Each completed seed is saved before chronological validation.';
+tuningHelp.textContent='CUDA checks actual GPU execution. Steps are shared across seeds. DQN uses replay/epsilon controls and pi layer widths for its Q-network; PPO-only rollout, GAE, entropy, clipping, epochs, KL and vf layer controls are ignored by DQN. DQN-only fields are ignored by PPO. Each seed is saved before validation. Neither algorithm guarantees profitability.';
 document.getElementById('trainfields').after(tuningHelp);
 for(const key of ['supervised_iterations','supervised_max_leaf_nodes','supervised_min_samples_leaf','ppo_timesteps','ppo_n_steps','ppo_batch_size','ppo_n_epochs'])ints.add(key);
 renderFields('candidatefields','cand_',candidateDefaults,{
@@ -1145,7 +1225,8 @@ function trainingSettings(){return readSettings('tr_',trainDefaults)}
 function filterSettings(query){for(const box of document.querySelectorAll('[data-setting]'))box.hidden=!box.textContent.toLowerCase().includes(query.toLowerCase())}
 function syncFeaturePicker(){const disabled=new Set(document.getElementById('cfg_disabled_features').value.split(',').map(s=>s.trim()));for(const option of document.getElementById('featurePicker').options)option.selected=disabled.has(option.value)}
 function setDisabledFeatures(){document.getElementById('cfg_disabled_features').value=Array.from(document.getElementById('featurePicker').selectedOptions).map(o=>o.value).join(',');updateModeSummary()}
-function updateModeSummary(){const c=envSettings();const gates=Object.entries(c).filter(([k,v])=>v===true&&(k.endsWith('_gate_enabled')||k==='regime_filter_enabled')).map(([k])=>k);document.getElementById('modeSummary').textContent=JSON.stringify({entry_mode:c.reference_strategy_enabled?'Reference signals restrict entries':'PPO chooses CE / PE / WAIT',exit_mode:c.learned_exit_enabled?'PPO chooses HOLD / EXIT':'Agent EXIT disabled',active_entry_gates:gates,forced_exits:['fixed_option_target_enabled','risk_reward_target_enabled','underlying_target_enabled','momentum_decay_exit_enabled','structural_stop_enabled','emergency_stop_enabled','max_hold_enabled','square_off_enabled'].filter(k=>c[k]),disabled_feature_groups:Object.keys(c).filter(k=>k.startsWith('features_')&&!c[k])},null,2)}
+function updateModeSummary(){const c=envSettings();const gates=Object.entries(c).filter(([k,v])=>v===true&&(k.endsWith('_gate_enabled')||k==='regime_filter_enabled')).map(([k])=>k);document.getElementById('modeSummary').textContent=JSON.stringify({algorithm:trainingSettings().algorithm,entry_mode:c.reference_strategy_enabled?'Reference signals restrict entries':'Policy chooses CE / PE / WAIT',exit_mode:c.learned_exit_enabled?'Policy chooses HOLD / EXIT':'Agent EXIT disabled',active_entry_gates:gates,forced_exits:['fixed_option_target_enabled','risk_reward_target_enabled','underlying_target_enabled','momentum_decay_exit_enabled','structural_stop_enabled','emergency_stop_enabled','max_hold_enabled','square_off_enabled'].filter(k=>c[k]),daily_budget:{profit_points:c.daily_profit_limit_enabled?c.daily_profit_target_points:null,loss_points:c.daily_loss_limit_enabled?c.daily_loss_limit_points:null,close_on_limit:c.close_on_daily_limit_enabled},disabled_feature_groups:Object.keys(c).filter(k=>k.startsWith('features_')&&!c[k])},null,2)}
+document.getElementById('tr_algorithm').addEventListener('change',updateModeSummary);
 document.getElementById('envfields').addEventListener('change',()=>{updateModeSummary();syncFeaturePicker()});updateModeSummary();
 async function loadDataStatus(){const target=document.getElementById('dataStatus');target.textContent='Checking dataset identity and execution partitions...';try{const response=await fetch('/api/data'),d=await response.json();if(!response.ok)throw Error(d.error+'\n'+(d.command||''));target.textContent=JSON.stringify({ready:d.ready,dataset_id:d.dataset_id,splits:d.splits,feature_count:d.features.length,cuda_available:d.cuda_available,cuda_devices:d.cuda_devices,quality:d.quality},null,2);const picker=document.getElementById('featurePicker');picker.replaceChildren();for(const name of [...d.features,...d.position_features])picker.add(new Option(name,name));syncFeaturePicker()}catch(e){target.textContent=e.message}}loadDataStatus();
 function drawLearning(history){const svg=document.getElementById('learningCurve');svg.replaceChildren();if(history.length<2)return;const values=history.flatMap(p=>[p.reward,p.mean20]),lo=Math.min(...values),hi=Math.max(...values),span=Math.max(hi-lo,1e-6);for(const [field,color] of [['reward','#768390'],['mean20','#3fb950']]){const line=document.createElementNS('http://www.w3.org/2000/svg','polyline');line.setAttribute('points',history.map((p,i)=>`${10+i*680/(history.length-1)},${150-(p[field]-lo)*140/span}`).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke',color);line.setAttribute('stroke-width','2');svg.append(line)}}
@@ -1185,6 +1266,7 @@ async function stopValidation(){try{await post('/api/validate/stop')}catch(e){al
 async function validateModel(){try{await post('/api/validate',{model:document.getElementById('evalmodel').value,split:document.getElementById('evalsplit').value,use_current_settings:document.getElementById('evaloverride').checked,environment:envSettings()})}catch(e){alert(e.message)}}
 async function loadModels(){const d=await(await fetch('/api/models')).json(),s=document.getElementById('evalmodel'),old=s.value;s.replaceChildren();for(const name of d.models)s.add(new Option(name,name));if(d.models.includes(old))s.value=old}
 const metrics={total_trading_days:'Trading day episodes',total_trades:'Trades',trades_per_day:'Trades/day',ce_trades:'CE trades',pe_trades:'PE trades',wins:'Wins',losses:'Losses',win_rate:'Win rate %',profit_factor:'Profit factor (net points)',average_winner_points:'Average winner points',average_loser_points:'Average loser points',payoff_ratio:'Winner/Loser payoff ratio',trades_ge_1_5R_pct:'Trades >= +1.5R %',average_R:'Average R',median_R:'Median R',cumulative_R:'Cumulative R',max_drawdown_R:'Max drawdown R',average_holding_minutes:'Average hold minutes',median_holding_minutes:'Median hold minutes',average_MFE_points:'Average MFE points',average_MAE_points:'Average MAE points',MFE_MAE_ratio:'MFE/MAE ratio',reached_40_points_pct:'Desired move reached %',stale_exits:'Estimated stale exits'};
+Object.assign(metrics,{net_option_points:'Total NET points',average_daily_points:'Average NET points/day (all day episodes)',average_daily_rupees:'Evaluated average NET rupees/day',worst_day_points:'Evaluated worst day NET points',best_day_points:'Evaluated best day NET points',profitable_days_pct:'Evaluated profitable days %'});
 function format(v){return v===null||v===undefined?'N/A':typeof v==='number'?Number(v.toFixed(3)).toLocaleString():String(v)}
 function cards(id,m){const parent=document.getElementById(id);parent.replaceChildren();for(const [key,label] of Object.entries(metrics)){const card=document.createElement('div');card.className='m';const title=document.createElement('div'),value=document.createElement('div');title.className='l';title.textContent=label;value.className='v';value.textContent=format(m[key]);card.append(title,value);parent.append(card)}}
 function entryExplanation(d){const x=d.entry_diagnostics;if(!x||!x.flat_steps)return 'Waiting for entry decisions';if(!x.buy_available_steps)return 'Both BUY actions were blocked on every flat step. See blocked_by; changing PPO rewards cannot unlock masked actions.';if(!x.entries_opened&&d.rejected_entries)return 'BUY actions were attempted but fills were rejected. Check next-bar quotes, time gaps, premium/risk and structural-stop conditions.';if(!x.entries_opened)return 'BUY actions were available, but PPO has not opened a position. See voluntary_wait_steps.';return `${x.entries_opened} entries opened; ${d.metrics.total_trades} trades closed. Trade cards count closed positions.`}
@@ -1235,6 +1317,9 @@ def parse_training_config(p):
         if isinstance(default, bool):
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be true/false")
+        elif isinstance(default, str):
+            if not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
         elif isinstance(default, int):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value:
                 raise ValueError(f"{key} must be a finite integer")
@@ -1248,8 +1333,18 @@ def parse_training_config(p):
 
     if cfg["total_timesteps"] <= 0 or cfg["n_steps"] < 2 or cfg["batch_size"] < 2 or cfg["n_epochs"] < 1:
         raise ValueError("Positive timesteps/epochs and rollout/batch sizes >= 2 are required")
-    if cfg["batch_size"] > cfg["n_steps"] or cfg["n_steps"] % cfg["batch_size"]:
+    if cfg["algorithm"] not in ("ppo", "dqn"):
+        raise ValueError("algorithm must be ppo or dqn")
+    if cfg["algorithm"] == "ppo" and (cfg["batch_size"] > cfg["n_steps"] or cfg["n_steps"] % cfg["batch_size"]):
         raise ValueError("Batch size must divide rollout steps")
+    if min(cfg["dqn_buffer_size"], cfg["dqn_train_freq"], cfg["dqn_gradient_steps"], cfg["dqn_target_update_interval"]) < 1:
+        raise ValueError("DQN replay size, train frequency, gradient steps and target interval must be positive")
+    if cfg["dqn_learning_starts"] < 0 or not 0 < cfg["dqn_tau"] <= 1:
+        raise ValueError("DQN learning starts must be nonnegative and tau must be in (0,1]")
+    if not 0 < cfg["dqn_exploration_fraction"] <= 1 or not 0 <= cfg["dqn_final_epsilon"] <= cfg["dqn_initial_epsilon"] <= 1:
+        raise ValueError("Invalid DQN exploration schedule")
+    if cfg["algorithm"] == "dqn" and cfg["batch_size"] > cfg["dqn_buffer_size"]:
+        raise ValueError("DQN replay buffer must hold at least one batch")
     if cfg["learning_rate"] <= 0 or not 0 < cfg["gamma"] <= 1 or not 0 < cfg["gae_lambda"] <= 1:
         raise ValueError("Invalid learning rate/gamma/GAE lambda")
     if cfg["num_seeds"] < 1 or cfg["num_seeds"] > 20:
@@ -1266,6 +1361,8 @@ def parse_training_config(p):
         raise ValueError("target_win_rate_pct must be <= 100")
     if cfg["target_win_rate_pct"] < 0 or cfg["target_profit_factor"] <= 0:
         raise ValueError("Target win rate must be >= 0 and target profit factor must be positive")
+    if not 0 <= cfg["target_daily_hit_rate_pct"] <= 100 or min(cfg["target_daily_points"], cfg["max_daily_loss_points"]) <= 0:
+        raise ValueError("Daily target hit rate must be 0..100; daily point targets/budgets must be positive")
     if cfg["min_validation_trades"] < 1:
         raise ValueError("min_validation_trades must be >= 1")
     if isinstance(p.get("min_trades_per_day"), bool) or cfg["min_trades_per_day"] < 0:
@@ -1437,7 +1534,7 @@ def candidate_models_api():
 @app.route("/api/models")
 def models_api():
     names = []
-    for path in sorted(MODEL_DIR.glob("banknifty_ppo_*.zip"), reverse=True):
+    for path in sorted(MODEL_DIR.glob("banknifty_*.zip"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
         try:
             model_files(path.name)
             names.append(path.name)

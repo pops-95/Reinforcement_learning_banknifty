@@ -1,5 +1,16 @@
 # Autonomous BANKNIFTY PPO
 
+PPO and masked DQN now share the website. See [DQN_TRADING.md](DQN_TRADING.md)
+for the DQN implementation, user-run checks and CLI commands. The new
+`settings/banknifty_dqn_trade_quality.json` and
+`settings/banknifty_ppo_trade_quality.json` presets disable all daily trading
+limits and daily income targets while keeping a per-trade protective stop.
+
+For the new +40 net daily points / -20 daily loss-trigger experiment, see
+[DAILY_TARGET_PRESET.md](DAILY_TARGET_PRESET.md) and load
+`settings/banknifty_daily40_loss20_autonomous.json`. It requires fresh training
+with the daily-budget environment; targets are not guaranteed performance.
+
 The default policy chooses `WAIT`, `BUY_CE`, or `BUY_PE` when flat, and `HOLD`
 or `EXIT` while invested. Both CE and PE are long option-premium positions. The
 contract is ATM at entry and stays fixed until exit. Strike/expiry selection

@@ -125,6 +125,67 @@ class AutonomousTests(unittest.TestCase):
             env.step(BUY_CE)
             self.assertEqual(env.position is None, enabled)
 
+    def test_daily_profit_can_accumulate_across_trades_and_resets_next_day(self):
+        env = self.env(daily_profit_limit_enabled=True, daily_profit_target_points=40.)
+        for index in (2, 4):
+            key = ("CE", env.day_df.timestamp.iloc[index])
+            env.option_lookup[key] = env.option_lookup[key]._replace(open=120.)
+        env.step(BUY_CE)
+        env.step(EXIT)
+        self.assertTrue(env.action_masks()[BUY_CE])
+        env.step(BUY_CE)
+        _, _, _, _, info = env.step(EXIT)
+        self.assertEqual(info["daily_net_points"], 40.)
+        self.assertEqual(info["daily_limit_reason"], "DAILY_PROFIT_TARGET")
+        self.assertEqual(env.action_masks().tolist(), [True, False, False, False, False])
+        env.reset()
+        self.assertEqual(env.daily_limit_reason, "")
+        self.assertTrue(env.action_masks()[BUY_CE])
+
+    def test_daily_loss_budget_accumulates_smaller_losses(self):
+        env = self.env(daily_loss_limit_enabled=True, daily_loss_limit_points=20.)
+        for index in (2, 4):
+            key = ("PE", env.day_df.timestamp.iloc[index])
+            env.option_lookup[key] = env.option_lookup[key]._replace(open=90.)
+        env.step(BUY_PE)
+        env.step(EXIT)
+        self.assertTrue(env.action_masks()[BUY_PE])
+        env.step(BUY_PE)
+        env.step(EXIT)
+        self.assertEqual(env._daily_net_points(), -20.)
+        self.assertEqual(env.daily_limit_reason, "DAILY_LOSS_LIMIT")
+        self.assertFalse(env.action_masks()[BUY_PE])
+
+    def test_daily_mark_trigger_fills_next_open_not_trigger_price(self):
+        env = self.env(daily_profit_limit_enabled=True, emergency_stop_enabled=False)
+        key = ("CE", env.day_df.timestamp.iloc[1])
+        env.option_lookup[key] = env.option_lookup[key]._replace(high=150., close=145.)
+        key = ("CE", env.day_df.timestamp.iloc[2])
+        env.option_lookup[key] = env.option_lookup[key]._replace(open=135.)
+        env.step(BUY_CE)
+        self.assertTrue(env.position["pending_exit"])
+        env.step(HOLD)
+        self.assertEqual(env.trade_log[0]["exit_reason"], "DAILY_PROFIT_TARGET")
+        self.assertEqual(env.trade_log[0]["option_pnl_points"], 35.)
+        self.assertFalse(env.action_masks()[BUY_CE])  # Sticky even after an adverse fill.
+
+    def test_realized_only_daily_budget_does_not_override_open_position(self):
+        env = self.env(daily_profit_limit_enabled=True, close_on_daily_limit_enabled=False)
+        key = ("CE", env.day_df.timestamp.iloc[1])
+        env.option_lookup[key] = env.option_lookup[key]._replace(high=150., close=145.)
+        env.step(BUY_CE)
+        self.assertFalse(env.position["pending_exit"])
+        self.assertEqual(env.daily_limit_reason, "")
+
+    def test_daily_target_counts_costs_not_gross_points(self):
+        env = self.env(daily_profit_limit_enabled=True, transaction_costs_enabled=True)
+        key = ("CE", env.day_df.timestamp.iloc[2])
+        env.option_lookup[key] = env.option_lookup[key]._replace(open=140.)
+        env.step(BUY_CE)
+        env.step(EXIT)
+        self.assertLess(env._daily_net_points(), 40.)
+        self.assertEqual(env.daily_limit_reason, "")
+
 
 class DataTests(unittest.TestCase):
     def test_missing_oi_not_forward_filled_and_returns_do_not_cross_gaps(self):
@@ -202,6 +263,31 @@ class WebConfigurationTests(unittest.TestCase):
         for payload in ({"seed": 1.5}, {"n_steps": True}, {"not_a_setting": 1}):
             with self.assertRaises(ValueError):
                 web.parse_training_config(payload)
+
+    def test_daily_preset_is_complete_and_web_loadable(self):
+        import banknifty_rl_web as web
+        path = Path(__file__).parent / "settings/banknifty_daily40_loss20_autonomous.json"
+        payload = json.loads(path.read_text())
+        response = web.app.test_client().post("/api/settings/validate", json=payload)
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(set(payload["environment"]), set(web.ENV_DEFAULTS))
+        # Older exports acquire new algorithm/DQN defaults without losing values.
+        self.assertTrue(set(payload["training"]).issubset(web.TRAIN_DEFAULTS))
+        self.assertTrue(response.json["settings"]["training"]["daily_targets_enabled"])
+
+    def test_daily_validation_includes_no_trade_days_and_loss_breaches(self):
+        import banknifty_rl_web as web
+        cfg = dict(web.TRAIN_DEFAULTS, daily_targets_enabled=True)
+        metrics = dict(total_trades=50, total_trading_days=2, trades_per_day=25,
+                       win_rate=80., profit_factor=2., average_R=1., daily_net_points=[40., 0.])
+        result = web.validation_target_results(metrics, cfg)
+        self.assertEqual(result["daily_target_hit_rate_pct"], 50.)
+        self.assertFalse(result["checks"]["daily_profit_target"])
+        self.assertFalse(result["targets_met"])
+        metrics["daily_net_points"] = [40., -21.]
+        self.assertFalse(web.validation_target_results(metrics, cfg)["checks"]["daily_loss_budget"])
+        metrics["daily_net_points"] = [40., 45.]
+        self.assertTrue(web.validation_target_results(metrics, cfg)["targets_met"])
 
 
 if __name__ == "__main__":

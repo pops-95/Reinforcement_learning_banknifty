@@ -19,7 +19,7 @@ from reference_strategy import ignition_features, structural_stop, select_contra
 from rl_data import DATA_VERSION, load_dataset, feature_group
 
 
-ENV_VERSION = "autonomous_ppo_v5_missingness"
+ENV_VERSION = "autonomous_ppo_v6_daily_budget"
 
 # Keep the same web-visible configuration keys.  No HTML/UI changes are needed.
 ENV_DEFAULTS = dict(
@@ -166,6 +166,14 @@ ENV_DEFAULTS = dict(
     square_off_time="15:25",
     min_desired_move_points=40.0,
 
+    # Session budgets use net premium points after modeled execution costs.
+    # Reaching a budget latches entry blocking until the next episode/day.
+    daily_profit_limit_enabled=False,
+    daily_profit_target_points=40.0,
+    daily_loss_limit_enabled=False,
+    daily_loss_limit_points=20.0,
+    close_on_daily_limit_enabled=True,
+
     # Optional reward shaping starts off; real net P&L is the primary reward.
     entry_penalty_enabled=False,
     entry_penalty_r=0.03,
@@ -227,6 +235,8 @@ POSITION_FEATURES = (
     "held_volume", "held_oi", "held_iv", "held_delta", "held_gamma", "held_theta", "held_vega",
     "held_volume_available", "held_oi_available", "held_iv_available", "held_delta_available",
     "held_gamma_available", "held_theta_available", "held_vega_available",
+    "daily_realized_points", "daily_net_points", "daily_limit_reached",
+    "daily_profit_remaining_points", "daily_loss_remaining_points",
 )
 
 # Simulation charge defaults. Verify against the broker/exchange schedule used in
@@ -297,6 +307,7 @@ def validate_config(payload):
         "trade_quantity", "reward_scale", "underlying_target_atr_multiplier",
         "fixed_option_target_points", "fixed_option_stop_points",
         "max_structural_stop_atr",
+        "daily_profit_target_points", "daily_loss_limit_points",
     )
     for key in positive_keys:
         if cfg[key] <= 0:
@@ -528,6 +539,7 @@ class BankNiftyEnv(gym.Env):
         self._reward_value = 0.0
         self._terminal_shaping_pending = 0.0
         self.daily_entries = 0
+        self.daily_limit_reason = ""
         self.last_exit_time = None
         self.last_exit_step = None
         self.last_exit_cooldown_minutes = self.reentry_cooldown_minutes
@@ -1059,6 +1071,17 @@ class BankNiftyEnv(gym.Env):
         )
         values["bars_since_exit_normalized"] = min(self.bars_since_exit, 375) / 375
         values["remaining_session_fraction"] = max(0, 930 - row.timestamp.hour*60 - row.timestamp.minute) / 375
+        realized = sum(t["option_pnl_points"] for t in self.trade_log)
+        net = self._daily_net_points()
+        values.update(
+            daily_realized_points=realized,
+            daily_net_points=net,
+            daily_limit_reached=float(bool(self.daily_limit_reason)),
+            daily_profit_remaining_points=(max(0.0, self.daily_profit_target_points - net)
+                                           if self.daily_profit_limit_enabled else 0.0),
+            daily_loss_remaining_points=(max(0.0, self.daily_loss_limit_points + net)
+                                         if self.daily_loss_limit_enabled else 0.0),
+        )
 
         if self.position:
             p = self.position
@@ -1252,6 +1275,30 @@ class BankNiftyEnv(gym.Env):
             value += self._liquidation_mark(self.position)
         return float(value)
 
+    def _daily_net_points(self):
+        points = sum(t["option_pnl_points"] for t in self.trade_log)
+        if self.position:
+            points += self._liquidation_mark(self.position) * self.position["initial_risk_points"]
+        return float(points)
+
+    def _update_daily_limits(self):
+        """Observe a completed bar; any forced exit fills at a later open.
+
+        These are trigger levels, not guaranteed fills: gaps, stale quotes and
+        slippage can overshoot either budget. No intrabar close-price lookahead.
+        """
+        net = (self._daily_net_points() if self.close_on_daily_limit_enabled
+               else sum(t["option_pnl_points"] for t in self.trade_log))
+        if not self.daily_limit_reason:
+            if self.daily_loss_limit_enabled and net <= -self.daily_loss_limit_points:
+                self.daily_limit_reason = "DAILY_LOSS_LIMIT"
+            elif self.daily_profit_limit_enabled and net >= self.daily_profit_target_points:
+                self.daily_limit_reason = "DAILY_PROFIT_TARGET"
+        if self.daily_limit_reason and self.position and self.close_on_daily_limit_enabled:
+            self.position["pending_exit"] = True
+            self.position.setdefault("pending_exit_reason", self.daily_limit_reason)
+            self.position["exit_requested_time"] = self.day_df.iloc[self.step_idx].timestamp
+
     # ------------------------------------------------------------------
     # Action masks / entries / exits
     # ------------------------------------------------------------------
@@ -1270,6 +1317,9 @@ class BankNiftyEnv(gym.Env):
             return mask
 
         mask[WAIT] = True
+        if self.daily_limit_reason:
+            self._entry_blocks = {"CE": [self.daily_limit_reason], "PE": [self.daily_limit_reason]}
+            return mask
         row = self.day_df.iloc[self.step_idx]
         next_time = (row.timestamp + pd.Timedelta(minutes=1)).time()
         if self.square_off_enabled and next_time >= self.square_off_time:
@@ -1746,6 +1796,7 @@ class BankNiftyEnv(gym.Env):
         self.step_idx += 1
         self._terminated = self.step_idx == len(self.day_df) - 1
         self._manage_position(final=self._terminated)
+        self._update_daily_limits()
 
         shaping = (
             self._shape_hold()
@@ -1774,6 +1825,8 @@ class BankNiftyEnv(gym.Env):
             shaping_reward_r=shaping,
             terminal_shaping_r=terminal_shaping,
             agent_exit_penalty_r=agent_exit_penalty,
+            daily_net_points=self._daily_net_points(),
+            daily_limit_reason=self.daily_limit_reason,
             cooldown_remaining=self.cooldown_remaining(),
             bars_since_exit=self.bars_since_exit,
             candidate_diagnostics=self._candidate_stats if self._terminated else None,
@@ -1795,6 +1848,7 @@ class BankNiftyEnv(gym.Env):
             self.episode_pnl = self.episode_reward = self._reward_value = 0.0
             self._terminal_shaping_pending = self._entry_penalty = 0.0
             self.daily_entries = 0
+            self.daily_limit_reason = ""
             self.last_exit_time = self.last_exit_step = None
             self.action_counts = dict.fromkeys(ACTION_NAMES, 0)
             self._terminated = False

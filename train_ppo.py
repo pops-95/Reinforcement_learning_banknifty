@@ -4,10 +4,11 @@ import json
 from pathlib import Path
 
 
-def main():
+def main(default_algorithm=None):
     parser = argparse.ArgumentParser()
     subs = parser.add_subparsers(dest="command", required=True)
     train = subs.add_parser("train")
+    train.add_argument("--algorithm", choices=["ppo", "dqn"], default=default_algorithm)
     train.add_argument("--timesteps", type=int)
     train.add_argument("--n-steps", type=int)
     train.add_argument("--batch-size", type=int)
@@ -29,7 +30,7 @@ def main():
     else:
         environment, training = payload, {}
     if args.command == "train":
-        overrides = dict(total_timesteps=args.timesteps, n_steps=args.n_steps,
+        overrides = dict(algorithm=args.algorithm, total_timesteps=args.timesteps, n_steps=args.n_steps,
                          batch_size=args.batch_size, n_epochs=args.epochs,
                          learning_rate=args.learning_rate, seed=args.seed)
         training.update({k: v for k, v in overrides.items() if v is not None})
@@ -43,7 +44,8 @@ def main():
         name = args.model
         if name == "latest":
             name = None
-            for path in sorted(web.MODEL_DIR.glob("banknifty_ppo_*.zip"), reverse=True):
+            pattern = "banknifty_dqn_*.zip" if default_algorithm == "dqn" else "banknifty_*.zip"
+            for path in sorted(web.MODEL_DIR.glob(pattern), key=lambda p: p.stat().st_mtime_ns, reverse=True):
                 try:
                     web.model_files(path.name)
                     name = path.name
@@ -51,7 +53,7 @@ def main():
                 except ValueError:
                     continue
             if name is None:
-                parser.error("No compatible autonomous PPO model; train a fresh model first")
+                parser.error("No compatible trading model; train a fresh model first")
         model, vec = web.model_files(name)
         override = web.parse_env_config(environment) if environment is not None else None
         web.EVAL_STATE.reset(1)
