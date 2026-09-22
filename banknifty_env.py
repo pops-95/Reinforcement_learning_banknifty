@@ -1,7 +1,8 @@
 """Autonomous five-action MaskablePPO with advisory indicators and optional gates.
 
 PPO chooses both entry directions and voluntary exits by default. Emergency and
-session exits are configurable overlays. Missing indicators never invent prices.
+session exits are configurable overlays. Fixed option targets and fixed option
+stops can be configured independently. Missing indicators never invent prices.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from reference_strategy import ignition_features, structural_stop, select_contra
 from rl_data import DATA_VERSION, load_dataset, feature_group
 
 
-ENV_VERSION = "autonomous_ppo_v6_opportunity_seeking"
+ENV_VERSION = "autonomous_ppo_v5_missingness"
 
 # Keep the same web-visible configuration keys.  No HTML/UI changes are needed.
 ENV_DEFAULTS = dict(
@@ -125,6 +126,12 @@ ENV_DEFAULTS = dict(
     fixed_option_target_enabled=False,
     fixed_option_target_points=40.0,
 
+    # Independent fixed option-premium stop-loss.
+    # This is deliberately separate from fixed_option_target_points so that,
+    # for example, a +40 point target can be paired with a -20 point stop.
+    fixed_option_stop_enabled=False,
+    fixed_option_stop_points=20.0,
+
     # Legacy R-multiple target retained for A/B tests, disabled in this experiment.
     risk_reward_target_enabled=False,
     risk_reward_target_r=1.50,
@@ -172,16 +179,6 @@ ENV_DEFAULTS = dict(
     giveback_fraction=0.5,
     giveback_min_mfe_r=1.0,
     max_shaping_r_per_trade=0.10,
-
-    # Opportunity-aware WAIT shaping.
-    # WAIT remains free during ordinary/noisy states.  A very small penalty is
-    # applied only when a strong causal opportunity is present and the relevant
-    # BUY action is actually available.  This discourages WAIT collapse without
-    # rewarding indiscriminate entries.
-    opportunity_wait_penalty_enabled=False,
-    opportunity_wait_penalty_r=0.002,
-    opportunity_score_threshold=0.65,
-
     terminal_win_shaping_enabled=False,
     terminal_win_bonus_r=0.03,
     terminal_win_min_points=10.0,
@@ -288,7 +285,6 @@ def validate_config(payload):
         "giveback_fraction", "min_abs_delta", "max_abs_delta",
         "ce_reference_ignition_min", "pe_reference_ignition_min",
         "ce_reference_direction_gap", "pe_reference_direction_gap",
-        "opportunity_score_threshold",
     )
     for key in probability_keys:
         if not 0 <= cfg[key] <= 1:
@@ -299,7 +295,8 @@ def validate_config(payload):
         "reference_pivot_left", "reference_pivot_right", "atr_period",
         "risk_reward_target_r", "stop_atr_multiplier", "max_hold_minutes",
         "trade_quantity", "reward_scale", "underlying_target_atr_multiplier",
-        "fixed_option_target_points", "max_structural_stop_atr",
+        "fixed_option_target_points", "fixed_option_stop_points",
+        "max_structural_stop_atr",
     )
     for key in positive_keys:
         if cfg[key] <= 0:
@@ -874,61 +871,6 @@ class BankNiftyEnv(gym.Env):
         total_weight = sum(w for _, w in components)
         return float(sum(v*w for v, w in components) / total_weight), True
 
-    def _opportunity_signal(self, row):
-        """Return (score, side) for a strong *causal* entry opportunity.
-
-        The score uses only information already available on the completed
-        decision candle.  It intentionally does not inspect any future candle
-        or realized trade outcome.
-
-        Reference bull/bear scores provide directional evidence when available.
-        The existing soft quality score contributes market quality/context.
-        A direction-gap term prevents two nearly-equal bull/bear scores from
-        being treated as a strong directional opportunity.
-
-        This is reward shaping only: it never forces BUY and never changes an
-        action mask.
-        """
-        ce_quality, ce_available = self._quality(row, "CE")
-        pe_quality, pe_available = self._quality(row, "PE")
-
-        bull = self._number(
-            row, "reference_bull", "ignition_bull", "p_bull"
-        )
-        bear = self._number(
-            row, "reference_bear", "ignition_bear", "p_bear"
-        )
-
-        # Preferred path when causal directional reference scores are present.
-        if bull is not None and bear is not None:
-            side = "CE" if bull >= bear else "PE"
-            directional = max(float(bull), float(bear))
-            gap = abs(float(bull) - float(bear))
-            quality = ce_quality if side == "CE" else pe_quality
-            quality_available = ce_available if side == "CE" else pe_available
-
-            # Scale directional separation around the existing reference gap.
-            gap_scale = max(float(self.reference_direction_gap), 0.05)
-            gap_score = float(np.clip(gap / (2.0 * gap_scale), 0.0, 1.0))
-
-            if quality_available:
-                score = 0.55 * directional + 0.30 * quality + 0.15 * gap_score
-            else:
-                score = 0.80 * directional + 0.20 * gap_score
-            return float(np.clip(score, 0.0, 1.0)), side
-
-        # Fallback when reference scores are unavailable: use the stronger
-        # current soft-quality side.  No future information is involved.
-        candidates = []
-        if ce_available:
-            candidates.append((float(ce_quality), "CE"))
-        if pe_available:
-            candidates.append((float(pe_quality), "PE"))
-        if not candidates:
-            return 0.0, None
-        score, side = max(candidates, key=lambda item: item[0])
-        return float(np.clip(score, 0.0, 1.0)), side
-
     def _entry_gate_details(self, row, side, quote):
         """Causal high-precision entry filters. Returns (valid, details)."""
         sign = 1.0 if side == "CE" else -1.0
@@ -1409,13 +1351,29 @@ class BankNiftyEnv(gym.Env):
         entry, entry_slippage = self._fill_price(raw, decision, is_buy=True)
         atr = self._number(decision, "atr")
         legacy_risk = min(self._risk_distance(entry, atr), 0.95 * entry)
-        # With a fixed premium target, normalise reward in units of the same fixed
-        # option-point objective.  This removes premium/strike-dependent R scaling.
-        risk = (float(self.fixed_option_target_points)
-                if self.fixed_option_target_enabled else legacy_risk)
-        if risk <= 0:
+
+        # Stop distance and target distance are intentionally independent.
+        #
+        # Example:
+        #   fixed_option_target_points = 40
+        #   fixed_option_stop_points   = 20
+        #
+        # gives a nominal +2R target before costs.  Reward normalisation uses
+        # the actual executable premium risk, not the target distance.
+        requested_stop_distance = (
+            float(self.fixed_option_stop_points)
+            if self.fixed_option_stop_enabled
+            else float(legacy_risk)
+        )
+        if requested_stop_distance <= 0:
             return False
-        if not self.fixed_option_target_enabled and risk >= entry:
+
+        # A long option premium cannot fall below zero.  For very cheap options,
+        # clamp the stop to a small positive premium and use the actual distance
+        # to that stop for R normalisation.
+        stop_price = max(0.05, float(entry) - requested_stop_distance)
+        risk = float(entry) - stop_price
+        if risk <= 0:
             return False
 
         spot = self._number(nxt, "open")
@@ -1460,7 +1418,7 @@ class BankNiftyEnv(gym.Env):
             entry_raw_price=float(raw), entry_price=entry,
             entry_slippage_fraction=entry_slippage,
             entry_time=nxt.timestamp, initial_risk_points=risk,
-            stop_price=entry - risk, last_price=float(raw),
+            stop_price=stop_price, last_price=float(raw),
             last_quote_time=nxt.timestamp, last_atr=atr or 0.0,
             atr_valid=atr is not None and atr > 0,
             high_since_entry=float(raw), low_since_entry=float(raw),
@@ -1591,7 +1549,15 @@ class BankNiftyEnv(gym.Env):
             entry_price_oi_pressure=p.get("entry_price_oi_pressure"),
             target_price=p.get("target_price"),
             target_mode=p.get("target_mode"),
-            fixed_option_target_points=(self.fixed_option_target_points if self.fixed_option_target_enabled else None),
+            fixed_option_target_points=(
+                self.fixed_option_target_points
+                if self.fixed_option_target_enabled else None
+            ),
+            fixed_option_stop_points=(
+                self.fixed_option_stop_points
+                if self.fixed_option_stop_enabled else None
+            ),
+            fixed_option_stop_enabled=self.fixed_option_stop_enabled,
             entry_filter_details=p.get("entry_filter_details"),
         )
 
@@ -1742,39 +1708,6 @@ class BankNiftyEnv(gym.Env):
         self._entry_penalty = 0.0
         rejected = False
 
-        # WAIT is penalized only when:
-        #   1) the agent intentionally chose a valid WAIT action while flat,
-        #   2) at least one BUY action is currently executable,
-        #   3) the causal opportunity score exceeds the configured threshold,
-        #   4) the preferred directional BUY action itself is available.
-        #
-        # Ordinary WAIT remains exactly zero-cost.  This avoids converting the
-        # environment into "trade all the time" while giving PPO a small reason
-        # to explore strong opportunities instead of collapsing to WAIT.
-        opportunity_wait_penalty = 0.0
-        opportunity_score = 0.0
-        opportunity_side = None
-        if (
-            self.opportunity_wait_penalty_enabled
-            and not was_holding
-            and action == WAIT
-            and not invalid
-            and bool(masks[BUY_CE] or masks[BUY_PE])
-        ):
-            decision_row = self.day_df.iloc[self.step_idx]
-            opportunity_score, opportunity_side = self._opportunity_signal(decision_row)
-            preferred_action = (
-                BUY_CE if opportunity_side == "CE"
-                else BUY_PE if opportunity_side == "PE"
-                else None
-            )
-            if (
-                opportunity_score >= self.opportunity_score_threshold
-                and preferred_action is not None
-                and bool(masks[preferred_action])
-            ):
-                opportunity_wait_penalty = float(self.opportunity_wait_penalty_r)
-
         if not was_holding and action in (BUY_CE, BUY_PE):
             rejected = not self._enter_position("CE" if action == BUY_CE else "PE")
         elif was_holding and action == EXIT and self.learned_exit_enabled:
@@ -1825,14 +1758,7 @@ class BankNiftyEnv(gym.Env):
         self._reward_value = marked
         terminal_shaping = self._terminal_shaping_pending
         self._terminal_shaping_pending = 0.0
-        unscaled = (
-            pnl_delta
-            - self._entry_penalty
-            - agent_exit_penalty
-            - opportunity_wait_penalty
-            + shaping
-            + terminal_shaping
-        )
+        unscaled = pnl_delta - self._entry_penalty - agent_exit_penalty + shaping + terminal_shaping
         self.episode_reward += unscaled
 
         obs = (
@@ -1848,9 +1774,6 @@ class BankNiftyEnv(gym.Env):
             shaping_reward_r=shaping,
             terminal_shaping_r=terminal_shaping,
             agent_exit_penalty_r=agent_exit_penalty,
-            opportunity_wait_penalty_r=opportunity_wait_penalty,
-            opportunity_score=opportunity_score,
-            opportunity_side=opportunity_side,
             cooldown_remaining=self.cooldown_remaining(),
             bars_since_exit=self.bars_since_exit,
             candidate_diagnostics=self._candidate_stats if self._terminated else None,
