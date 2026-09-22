@@ -1,0 +1,6 @@
+# Additional dependency for learned-exit training, alongside the existing app dependencies.
+# Install with the same Python interpreter that runs banknifty_rl_web.py.
+sb3-contrib>=2.3,<3
+# CPU supervised candidate-quality learner and its local artifact serialization.
+scikit-learn>=1.3,<2
+joblib>=1.3,<2

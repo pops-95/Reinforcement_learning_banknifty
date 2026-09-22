@@ -1,0 +1,11 @@
+# Install your CUDA build of PyTorch first (see AUTONOMOUS_RL.md).
+numpy>=1.24,<3
+pandas>=2.1,<3
+pyarrow>=14
+gymnasium>=0.29.1,<1.3
+stable-baselines3>=2.7,<3
+sb3-contrib>=2.7,<3
+Flask>=3,<4
+tensorboard>=2.15,<3
+scikit-learn>=1.3,<2
+joblib>=1.3,<2

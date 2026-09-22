@@ -1,0 +1,6 @@
+.venv/*
+.venv-rl/
+__pycache__/
+data/*
+models/*
+_backup_data/*
