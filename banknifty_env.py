@@ -19,7 +19,7 @@ from reference_strategy import ignition_features, structural_stop, select_contra
 from rl_data import DATA_VERSION, load_dataset, feature_group
 
 
-ENV_VERSION = "autonomous_ppo_v6_daily_budget"
+ENV_VERSION = "autonomous_ppo_v8_htf_wait_penalty"
 
 # Keep the same web-visible configuration keys.  No HTML/UI changes are needed.
 ENV_DEFAULTS = dict(
@@ -113,6 +113,24 @@ ENV_DEFAULTS = dict(
     last_entry_time_enabled=True,
     last_entry_time="15:00",
 
+    # Causal higher-timeframe direction.
+    # The current 1-minute decision may use only HTF bars that are fully closed
+    # by the end of that 1-minute candle (timestamp + 1 minute).
+    htf_direction_enabled=False,
+    htf_primary_minutes=5,
+    htf_secondary_enabled=True,
+    htf_secondary_minutes=15,
+    htf_fast_ema_span=2,
+    htf_slow_ema_span=4,
+    htf_return_bars=1,
+    htf_primary_min_return=0.00020,
+    htf_secondary_min_return=0.00030,
+    htf_entry_gate_enabled=False,
+    htf_entry_require_secondary=True,
+    htf_exit_on_reversal_enabled=False,
+    htf_exit_require_secondary_not_supporting=True,
+    htf_exit_on_neutral_enabled=False,
+
     # Structural/reference exits
     structural_stop_enabled=False,
     reference_structural_lookback=45,
@@ -186,6 +204,13 @@ ENV_DEFAULTS = dict(
     overtrading_penalty_enabled=False,
     free_trades_per_day=4,
     extra_trade_penalty_r=0.05,
+
+    # Tiny opportunity-cost shaping for a deliberate WAIT.
+    # This is charged only when flat and BUY_CE or BUY_PE is actually available.
+    voluntary_wait_penalty_enabled=False,
+    voluntary_wait_penalty_r=0.001,
+    max_voluntary_wait_penalty_r_per_day=0.05,
+
     hold_shaping_enabled=False,
     hold_bonus_r=0.002,
     giveback_penalty_enabled=False,
@@ -241,7 +266,11 @@ POSITION_FEATURES = (
     "directional_momentum_score", "path_efficiency_value", "atr_expansion_value",
     "extension_atr_value", "price_oi_pressure_value",
     "reference_bull", "reference_bear", "reference_stop_distance_underlying",
-    "reference_scores_available", "net_liquidation_R", "remaining_session_fraction",
+    "reference_scores_available",
+    "htf_primary_direction", "htf_secondary_direction", "htf_alignment",
+    "htf_primary_return", "htf_secondary_return",
+    "htf_primary_available", "htf_secondary_available",
+    "net_liquidation_R", "remaining_session_fraction",
     "held_volume", "held_oi", "held_iv", "held_delta", "held_gamma", "held_theta", "held_vega",
     "held_volume_available", "held_oi_available", "held_iv_available", "held_delta_available",
     "held_gamma_available", "held_theta_available", "held_vega_available",
@@ -321,6 +350,8 @@ def validate_config(payload):
         "max_structural_stop_atr",
         "daily_profit_target_points", "daily_loss_limit_points",
         "loss_aversion_multiplier",
+        "htf_primary_minutes", "htf_secondary_minutes",
+        "htf_fast_ema_span", "htf_slow_ema_span", "htf_return_bars",
     )
     for key in positive_keys:
         if cfg[key] <= 0:
@@ -346,6 +377,14 @@ def validate_config(payload):
         raise ValueError("Keep shaping modest: max_shaping_r_per_trade <= 0.25R")
     if cfg["loss_aversion_multiplier"] < 1:
         raise ValueError("loss_aversion_multiplier must be >= 1")
+    if cfg["htf_fast_ema_span"] >= cfg["htf_slow_ema_span"]:
+        raise ValueError("htf_fast_ema_span must be < htf_slow_ema_span")
+    if cfg["htf_primary_minutes"] < 2 or cfg["htf_secondary_minutes"] < 2:
+        raise ValueError("HTF minute values must be >= 2")
+    if cfg["htf_secondary_enabled"] and cfg["htf_secondary_minutes"] <= cfg["htf_primary_minutes"]:
+        raise ValueError("htf_secondary_minutes must be greater than htf_primary_minutes")
+    if cfg["htf_primary_min_return"] >= 1 or cfg["htf_secondary_min_return"] >= 1:
+        raise ValueError("HTF minimum returns must be fractional values below 1")
 
     first = parse_clock(cfg["first_entry_time"], "first_entry_time")
     last = parse_clock(cfg["last_entry_time"], "last_entry_time")
@@ -545,6 +584,7 @@ class BankNiftyEnv(gym.Env):
             close.diff(periods).abs() / distance.replace(0.0, np.nan)
         ).where(distance != 0.0, 0.0).clip(0.0, 1.0)
 
+        self._prepare_htf_direction_day()
         self._load_option_partition(self.day_df.expiry.iloc[0])
         if (self.reference_strategy_enabled or self.reference_features_enabled
                 or self.price_oi_gate_enabled or self.momentum_decay_exit_enabled):
@@ -575,6 +615,7 @@ class BankNiftyEnv(gym.Env):
         self._terminal_shaping_pending = 0.0
         self.daily_entries = 0
         self.daily_limit_reason = ""
+        self.daily_voluntary_wait_penalty_r = 0.0
         self.last_exit_time = None
         self.last_exit_step = None
         self.last_exit_cooldown_minutes = self.reentry_cooldown_minutes
@@ -617,6 +658,173 @@ class BankNiftyEnv(gym.Env):
         return bool(self.daily_limit_reason
                     or (self.last_entry_time_enabled and clock >= self.last_entry_time)
                     or (self.square_off_enabled and clock >= self.square_off_time))
+
+    def _prepare_htf_direction_day(self):
+        """Build causal 5m/15m-style direction from completed BANKNIFTY bars.
+
+        The source 1-minute timestamp is treated as the start of that minute.
+        Therefore a row at 09:19 becomes fully known at 09:20.  HTF values are
+        mapped with decision_time = timestamp + 1 minute, so an HTF bar is never
+        visible before its own closing boundary.
+        """
+        for prefix in ("primary", "secondary"):
+            self.day_df[f"htf_{prefix}_direction"] = 0.0
+            self.day_df[f"htf_{prefix}_return"] = 0.0
+            self.day_df[f"htf_{prefix}_available"] = 0.0
+
+        if not self.htf_direction_enabled:
+            return
+
+        def build(minutes, min_return, prefix):
+            source = self.day_df[["timestamp", "open", "high", "low", "close"]].copy()
+            source = source.dropna(subset=["timestamp", "open", "high", "low", "close"])
+            if source.empty:
+                return
+
+            source = source.sort_values("timestamp").set_index("timestamp")
+            rule = f"{int(minutes)}min"
+            origin = pd.Timestamp(self.day_df.timestamp.iloc[0])
+
+            bars = source.resample(
+                rule, origin=origin, label="right", closed="left"
+            ).agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                count=("close", "count"),
+            )
+
+            # Require every constituent 1-minute candle.  A partial or gapped HTF
+            # candle is never allowed to create direction.
+            bars = bars.loc[bars["count"] >= int(minutes)].copy()
+            if bars.empty:
+                return
+
+            bars["fast"] = bars["close"].ewm(
+                span=int(self.htf_fast_ema_span), adjust=False
+            ).mean()
+            bars["slow"] = bars["close"].ewm(
+                span=int(self.htf_slow_ema_span), adjust=False
+            ).mean()
+            bars["ret"] = bars["close"].pct_change(int(self.htf_return_bars))
+
+            enough_history = np.arange(len(bars)) >= int(self.htf_return_bars)
+            bull = (
+                enough_history
+                & bars["ret"].notna().to_numpy()
+                & (bars["fast"].to_numpy() > bars["slow"].to_numpy())
+                & (bars["ret"].to_numpy() >= float(min_return))
+            )
+            bear = (
+                enough_history
+                & bars["ret"].notna().to_numpy()
+                & (bars["fast"].to_numpy() < bars["slow"].to_numpy())
+                & (bars["ret"].to_numpy() <= -float(min_return))
+            )
+            bars["direction"] = np.select([bull, bear], [1.0, -1.0], default=0.0)
+            bars["available"] = enough_history.astype(float)
+            bars = bars.reset_index().rename(columns={"timestamp": "htf_close_time"})
+
+            decisions = pd.DataFrame({
+                "decision_time": self.day_df.timestamp + pd.Timedelta(minutes=1)
+            })
+            mapped = pd.merge_asof(
+                decisions.sort_values("decision_time"),
+                bars[["htf_close_time", "direction", "ret", "available"]]
+                    .sort_values("htf_close_time"),
+                left_on="decision_time",
+                right_on="htf_close_time",
+                direction="backward",
+                allow_exact_matches=True,
+            )
+
+            self.day_df[f"htf_{prefix}_direction"] = (
+                mapped["direction"].fillna(0.0).to_numpy(dtype=float)
+            )
+            self.day_df[f"htf_{prefix}_return"] = (
+                mapped["ret"].fillna(0.0).to_numpy(dtype=float)
+            )
+            self.day_df[f"htf_{prefix}_available"] = (
+                mapped["available"].fillna(0.0).to_numpy(dtype=float)
+            )
+
+        build(
+            self.htf_primary_minutes,
+            self.htf_primary_min_return,
+            "primary",
+        )
+        if self.htf_secondary_enabled:
+            build(
+                self.htf_secondary_minutes,
+                self.htf_secondary_min_return,
+                "secondary",
+            )
+
+    def _htf_entry_allows(self, row, side):
+        """Return (allowed, diagnostics) for HTF directional entry confirmation."""
+        if not (self.htf_direction_enabled and self.htf_entry_gate_enabled):
+            return True, {}
+
+        sign = 1.0 if side == "CE" else -1.0
+        p_avail = bool(self._number(row, "htf_primary_available") or 0.0)
+        p_dir = self._number(row, "htf_primary_direction")
+        s_avail = bool(self._number(row, "htf_secondary_available") or 0.0)
+        s_dir = self._number(row, "htf_secondary_direction")
+
+        details = {
+            "primary_available": p_avail,
+            "primary_direction": p_dir,
+            "secondary_available": s_avail,
+            "secondary_direction": s_dir,
+        }
+
+        if not p_avail or p_dir != sign:
+            return False, details
+
+        if self.htf_secondary_enabled and self.htf_entry_require_secondary:
+            if not s_avail or s_dir != sign:
+                return False, details
+
+        return True, details
+
+    def _htf_exit_reason(self, row, position):
+        """Force an exit only after a causal higher-timeframe direction change.
+
+        Default logic is intentionally slower than a raw 5-minute flip:
+        - the primary HTF must reverse against the held side, and
+        - when configured, the secondary HTF must no longer support the position.
+        A full secondary reversal can also exit when the primary is no longer supportive.
+        """
+        if not (self.htf_direction_enabled and self.htf_exit_on_reversal_enabled):
+            return None
+
+        sign = 1.0 if position["type"] == "CE" else -1.0
+        p_avail = bool(self._number(row, "htf_primary_available") or 0.0)
+        p_dir = self._number(row, "htf_primary_direction")
+        s_avail = bool(self._number(row, "htf_secondary_available") or 0.0)
+        s_dir = self._number(row, "htf_secondary_direction")
+
+        primary_reversed = p_avail and p_dir == -sign
+        primary_neutral = p_avail and p_dir == 0
+        secondary_reversed = self.htf_secondary_enabled and s_avail and s_dir == -sign
+        secondary_supports = self.htf_secondary_enabled and s_avail and s_dir == sign
+
+        if primary_reversed:
+            if self.htf_exit_require_secondary_not_supporting:
+                if self.htf_secondary_enabled:
+                    if not s_avail or secondary_supports:
+                        return None
+            return "HTF_DIRECTION_REVERSAL"
+
+        if secondary_reversed and p_avail and p_dir != sign:
+            return "HTF_DIRECTION_REVERSAL"
+
+        if self.htf_exit_on_neutral_enabled and primary_neutral:
+            if not self.htf_secondary_enabled or (s_avail and not secondary_supports):
+                return "HTF_DIRECTION_NEUTRAL"
+
+        return None
 
     def _prepare_underlying_context_only(self):
         prev = self.day_df.close.shift(1)
@@ -1216,6 +1424,25 @@ class BankNiftyEnv(gym.Env):
         values["extension_atr_value"] = sign_hint*(close-e20)/uatr if close is not None and e20 is not None and uatr and uatr > 0 else 0.0
         values["price_oi_pressure_value"] = self._number(row, "reference_price_oi_pressure") or 0.0
 
+        values["htf_primary_direction"] = self._number(row, "htf_primary_direction") or 0.0
+        values["htf_secondary_direction"] = self._number(row, "htf_secondary_direction") or 0.0
+        values["htf_primary_return"] = self._number(row, "htf_primary_return") or 0.0
+        values["htf_secondary_return"] = self._number(row, "htf_secondary_return") or 0.0
+        values["htf_primary_available"] = self._number(row, "htf_primary_available") or 0.0
+        values["htf_secondary_available"] = self._number(row, "htf_secondary_available") or 0.0
+        values["htf_alignment"] = (
+            values["htf_primary_direction"]
+            if values["htf_primary_available"]
+            and (
+                not self.htf_secondary_enabled
+                or (
+                    values["htf_secondary_available"]
+                    and values["htf_primary_direction"] == values["htf_secondary_direction"]
+                )
+            )
+            else 0.0
+        )
+
         scores = [self._quality(row, side) for side in ("CE", "PE")]
         values["tradeability_score"] = max(s[0] for s in scores)
         values["tradeability_score_available"] = float(any(s[1] for s in scores))
@@ -1236,6 +1463,9 @@ class BankNiftyEnv(gym.Env):
             "directional_momentum_score": "momentum", "path_efficiency_value": "momentum",
             "atr_expansion_value": "volatility", "extension_atr_value": "trend",
             "price_oi_pressure_value": "oi", "remaining_session_fraction": "time",
+            "htf_primary_direction": "trend", "htf_secondary_direction": "trend",
+            "htf_alignment": "trend", "htf_primary_return": "momentum",
+            "htf_secondary_return": "momentum",
             "held_option_atr": "volatility", "atr_available": "volatility",
             "iv_change_since_entry": "greeks", "iv_change_available": "greeks",
             "delta_change_since_entry": "greeks", "delta_change_available": "greeks",
@@ -1422,6 +1652,12 @@ class BankNiftyEnv(gym.Env):
                     if pd.isna(row.reference_stop):
                         reasons.append("missing_structural_stop")
 
+            if self.htf_direction_enabled and self.htf_entry_gate_enabled:
+                htf_ok, htf_details = self._htf_entry_allows(row, side)
+                valid = valid and htf_ok
+                if not htf_ok:
+                    reasons.append("htf_direction")
+
             if self.tradeability_gate_enabled:
                 score, available = self._quality(row, side)
                 valid = valid and available and score >= self.tradeability_threshold
@@ -1504,9 +1740,14 @@ class BankNiftyEnv(gym.Env):
             if stop is None or (spot <= stop if side == "CE" else spot >= stop):
                 return False
 
+        htf_ok, htf_details = self._htf_entry_allows(row, side)
+        if not htf_ok:
+            return False
+
         filters_ok, filter_details = self._entry_gate_details(row, side, decision)
         if not filters_ok:
             return False
+        filter_details["htf"] = htf_details
 
         target_points = self._dynamic_underlying_target(row)
         target_price = None
@@ -1556,6 +1797,10 @@ class BankNiftyEnv(gym.Env):
                 entry_ignition_bull=self._number(row, "reference_bull"),
                 entry_ignition_bear=self._number(row, "reference_bear"),
                 entry_price_oi_pressure=self._number(row, "reference_price_oi_pressure"),
+                entry_htf_primary_direction=self._number(row, "htf_primary_direction"),
+                entry_htf_secondary_direction=self._number(row, "htf_secondary_direction"),
+                entry_htf_primary_return=self._number(row, "htf_primary_return"),
+                entry_htf_secondary_return=self._number(row, "htf_secondary_return"),
             )
         return True
 
@@ -1566,6 +1811,10 @@ class BankNiftyEnv(gym.Env):
         if self.structural_stop_enabled and p.get("structural_stop") is not None:
             if (row.low <= p["structural_stop"] if sign == 1 else row.high >= p["structural_stop"]):
                 return "STRUCTURAL_STOP"
+
+        htf_reason = self._htf_exit_reason(row, p)
+        if htf_reason:
+            return htf_reason
 
         if self.underlying_target_enabled and p.get("spot_entry") is not None:
             if sign * (row.close - p["spot_entry"]) >= p["underlying_target_points"]:
@@ -1684,6 +1933,18 @@ class BankNiftyEnv(gym.Env):
             ),
             fixed_option_stop_enabled=self.fixed_option_stop_enabled,
             entry_filter_details=p.get("entry_filter_details"),
+            entry_htf_primary_direction=p.get("entry_htf_primary_direction"),
+            entry_htf_secondary_direction=p.get("entry_htf_secondary_direction"),
+            entry_htf_primary_return=p.get("entry_htf_primary_return"),
+            entry_htf_secondary_return=p.get("entry_htf_secondary_return"),
+            exit_htf_primary_direction=self._number(
+                self.day_df.iloc[min(self.step_idx, len(self.day_df)-1)],
+                "htf_primary_direction"
+            ),
+            exit_htf_secondary_direction=self._number(
+                self.day_df.iloc[min(self.step_idx, len(self.day_df)-1)],
+                "htf_secondary_direction"
+            ),
         )
 
         self.trade_log.append(record)
@@ -1831,6 +2092,26 @@ class BankNiftyEnv(gym.Env):
         semantic = ACTION_NAMES[action]
         self.action_counts[semantic] += 1
         self._entry_penalty = 0.0
+
+        voluntary_wait = bool(
+            not was_holding
+            and action == WAIT
+            and not invalid
+            and (masks[BUY_CE] or masks[BUY_PE])
+        )
+        voluntary_wait_penalty = 0.0
+        if self.voluntary_wait_penalty_enabled and voluntary_wait:
+            remaining_cap = max(
+                0.0,
+                float(self.max_voluntary_wait_penalty_r_per_day)
+                - float(self.daily_voluntary_wait_penalty_r),
+            )
+            voluntary_wait_penalty = min(
+                float(self.voluntary_wait_penalty_r),
+                remaining_cap,
+            )
+            self.daily_voluntary_wait_penalty_r += voluntary_wait_penalty
+
         rejected = False
 
         if not was_holding and action in (BUY_CE, BUY_PE):
@@ -1886,7 +2167,14 @@ class BankNiftyEnv(gym.Env):
         self._reward_value = marked
         terminal_shaping = self._terminal_shaping_pending
         self._terminal_shaping_pending = 0.0
-        unscaled = pnl_delta - self._entry_penalty - agent_exit_penalty + shaping + terminal_shaping
+        unscaled = (
+            pnl_delta
+            - self._entry_penalty
+            - agent_exit_penalty
+            - voluntary_wait_penalty
+            + shaping
+            + terminal_shaping
+        )
         self.episode_reward += unscaled
 
         obs = (
@@ -1898,8 +2186,9 @@ class BankNiftyEnv(gym.Env):
             episode_reward=self.episode_reward, trades=len(self.trade_log),
             action_name=semantic, invalid_action=invalid,
             entry_available=bool(not was_holding and (masks[BUY_CE] or masks[BUY_PE])),
-            voluntary_wait=bool(not was_holding and action == WAIT and not invalid
-                                and (masks[BUY_CE] or masks[BUY_PE])),
+            voluntary_wait=voluntary_wait,
+            voluntary_wait_penalty_r=voluntary_wait_penalty,
+            daily_voluntary_wait_penalty_r=self.daily_voluntary_wait_penalty_r,
             entry_opened=bool(not was_holding and action in (BUY_CE, BUY_PE) and not rejected),
             episode_start_time=self.episode_start_time,
             partial_session=self.episode_partial_session,
