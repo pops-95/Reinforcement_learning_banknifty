@@ -19,7 +19,7 @@ from reference_strategy import ignition_features, structural_stop, select_contra
 from rl_data import DATA_VERSION, load_dataset, feature_group
 
 
-ENV_VERSION = "autonomous_ppo_v8_htf_wait_penalty"
+ENV_VERSION = "autonomous_ppo_v9_htf_veto"
 
 # Keep the same web-visible configuration keys.  No HTML/UI changes are needed.
 ENV_DEFAULTS = dict(
@@ -269,7 +269,7 @@ POSITION_FEATURES = (
     "reference_scores_available",
     "htf_primary_direction", "htf_secondary_direction", "htf_alignment",
     "htf_primary_return", "htf_secondary_return",
-    "htf_primary_available", "htf_secondary_available",
+    "htf_primary_available", "htf_secondary_available", "htf_fast_exit_signal",
     "net_liquidation_R", "remaining_session_fraction",
     "held_volume", "held_oi", "held_iv", "held_delta", "held_gamma", "held_theta", "held_vega",
     "held_volume_available", "held_oi_available", "held_iv_available", "held_delta_available",
@@ -762,7 +762,18 @@ class BankNiftyEnv(gym.Env):
             )
 
     def _htf_entry_allows(self, row, side):
-        """Return (allowed, diagnostics) for HTF directional entry confirmation."""
+        """Return (allowed, diagnostics) for causal HTF directional entry confirmation.
+
+        Entry hierarchy:
+        - primary HTF (typically 5m) defines the active direction;
+        - secondary HTF (typically 15m) may confirm that direction, or when
+          `htf_entry_require_secondary` is false it acts only as a veto.
+
+        Veto mode:
+        - CE requires primary bullish and secondary not bearish.
+        - PE requires primary bearish and secondary not bullish.
+        A neutral secondary timeframe therefore does not block a valid 5m move.
+        """
         if not (self.htf_direction_enabled and self.htf_entry_gate_enabled):
             return True, {}
 
@@ -777,24 +788,39 @@ class BankNiftyEnv(gym.Env):
             "primary_direction": p_dir,
             "secondary_available": s_avail,
             "secondary_direction": s_dir,
+            "secondary_mode": (
+                "confirm" if self.htf_entry_require_secondary else "veto"
+            ),
         }
 
+        # Primary HTF must always define the active trade side.
         if not p_avail or p_dir != sign:
             return False, details
 
-        if self.htf_secondary_enabled and self.htf_entry_require_secondary:
-            if not s_avail or s_dir != sign:
-                return False, details
+        if self.htf_secondary_enabled:
+            if self.htf_entry_require_secondary:
+                # Strict alignment mode.
+                if not s_avail or s_dir != sign:
+                    return False, details
+            else:
+                # Veto mode: neutral/unavailable secondary does not block,
+                # but an explicit opposite secondary trend does.
+                if s_avail and s_dir == -sign:
+                    return False, details
 
         return True, details
 
     def _htf_exit_reason(self, row, position):
-        """Force an exit only after a causal higher-timeframe direction change.
+        """Return a forced causal HTF exit reason when direction materially changes.
 
-        Default logic is intentionally slower than a raw 5-minute flip:
-        - the primary HTF must reverse against the held side, and
-        - when configured, the secondary HTF must no longer support the position.
-        A full secondary reversal can also exit when the primary is no longer supportive.
+        Exit hierarchy:
+        1. If the secondary HTF fully reverses against the position, force exit.
+        2. If the primary HTF reverses and the secondary no longer supports the
+           held side (neutral/opposite/unavailable when confirmation is required),
+           force exit.
+        3. A primary-only reversal does not force an exit; it is handled by
+           `_htf_fast_exit_condition`, which makes PPO EXIT immediately available
+           even before the normal minimum-hold period has elapsed.
         """
         if not (self.htf_direction_enabled and self.htf_exit_on_reversal_enabled):
             return None
@@ -810,21 +836,41 @@ class BankNiftyEnv(gym.Env):
         secondary_reversed = self.htf_secondary_enabled and s_avail and s_dir == -sign
         secondary_supports = self.htf_secondary_enabled and s_avail and s_dir == sign
 
-        if primary_reversed:
-            if self.htf_exit_require_secondary_not_supporting:
-                if self.htf_secondary_enabled:
-                    if not s_avail or secondary_supports:
-                        return None
-            return "HTF_DIRECTION_REVERSAL"
+        # A full 15m reversal is strong enough to force the position out.
+        if secondary_reversed:
+            return "HTF_SECONDARY_REVERSAL"
 
-        if secondary_reversed and p_avail and p_dir != sign:
-            return "HTF_DIRECTION_REVERSAL"
+        # 5m reversal plus loss of 15m support is a confirmed reversal.
+        if primary_reversed:
+            if not self.htf_secondary_enabled:
+                return "HTF_DIRECTION_REVERSAL"
+
+            if self.htf_exit_require_secondary_not_supporting:
+                if not secondary_supports:
+                    return "HTF_DIRECTION_REVERSAL"
+            else:
+                return "HTF_DIRECTION_REVERSAL"
 
         if self.htf_exit_on_neutral_enabled and primary_neutral:
-            if not self.htf_secondary_enabled or (s_avail and not secondary_supports):
+            if not self.htf_secondary_enabled or not secondary_supports:
                 return "HTF_DIRECTION_NEUTRAL"
 
         return None
+
+    def _htf_fast_exit_condition(self, row, position):
+        """Primary-HTF reversal unlocks PPO EXIT immediately.
+
+        This is deliberately softer than a forced exit. It lets the 1-minute
+        policy decide whether to exit at once when 5m turns against the trade,
+        even if `min_hold_minutes` has not yet elapsed.
+        """
+        if not (self.htf_direction_enabled and self.htf_exit_on_reversal_enabled):
+            return False
+
+        sign = 1.0 if position["type"] == "CE" else -1.0
+        p_avail = bool(self._number(row, "htf_primary_available") or 0.0)
+        p_dir = self._number(row, "htf_primary_direction")
+        return bool(p_avail and p_dir == -sign)
 
     def _prepare_underlying_context_only(self):
         prev = self.day_df.close.shift(1)
@@ -1442,6 +1488,10 @@ class BankNiftyEnv(gym.Env):
             )
             else 0.0
         )
+        values["htf_fast_exit_signal"] = (
+            float(self._htf_fast_exit_condition(row, self.position))
+            if self.position else 0.0
+        )
 
         scores = [self._quality(row, side) for side in ("CE", "PE")]
         values["tradeability_score"] = max(s[0] for s in scores)
@@ -1464,7 +1514,8 @@ class BankNiftyEnv(gym.Env):
             "atr_expansion_value": "volatility", "extension_atr_value": "trend",
             "price_oi_pressure_value": "oi", "remaining_session_fraction": "time",
             "htf_primary_direction": "trend", "htf_secondary_direction": "trend",
-            "htf_alignment": "trend", "htf_primary_return": "momentum",
+            "htf_alignment": "trend", "htf_fast_exit_signal": "trend",
+            "htf_primary_return": "momentum",
             "htf_secondary_return": "momentum",
             "held_option_atr": "volatility", "atr_available": "volatility",
             "iv_change_since_entry": "greeks", "iv_change_available": "greeks",
@@ -1608,8 +1659,18 @@ class BankNiftyEnv(gym.Env):
 
         if self.position:
             mask[HOLD] = True
-            hold_ok = (not self.min_hold_enabled) or self.position["bars_held"] >= self.min_hold_minutes
-            mask[EXIT] = bool(self.learned_exit_enabled and hold_ok and not self.position["pending_exit"])
+            row = self.day_df.iloc[self.step_idx]
+            htf_fast_exit = self._htf_fast_exit_condition(row, self.position)
+            hold_ok = (
+                (not self.min_hold_enabled)
+                or self.position["bars_held"] >= self.min_hold_minutes
+                or htf_fast_exit
+            )
+            mask[EXIT] = bool(
+                self.learned_exit_enabled
+                and hold_ok
+                and not self.position["pending_exit"]
+            )
             return mask
 
         mask[WAIT] = True
@@ -1858,7 +1919,7 @@ class BankNiftyEnv(gym.Env):
                 terminal_shaping -= self.emergency_stop_penalty_r
             elif reason == "TIME_LIMIT" and net_points < 0:
                 terminal_shaping -= self.time_limit_loss_penalty_r
-            elif reason == "MOMENTUM_DECAY" and net_points < 0:
+            elif reason in {"MOMENTUM_DECAY", "HTF_DIRECTION_REVERSAL", "HTF_SECONDARY_REVERSAL"} and net_points < 0:
                 terminal_shaping -= self.momentum_decay_loss_penalty_r
         elif (net_points > 0 and net_points >= self.terminal_win_min_points
                 and self.terminal_win_shaping_enabled and not stale):
