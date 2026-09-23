@@ -86,8 +86,10 @@ class TradeFrequencyTests(unittest.TestCase):
         path = Path(__file__).parent / "settings" / "banknifty_settings_v1.6_min2_trades.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         loaded = validate_settings_file(payload)["settings"]
-        self.assertEqual(loaded["environment"], payload["environment"])
-        self.assertEqual(loaded["training"], payload["training"])
+        # New optional controls default safely without changing saved values.
+        for section in ("environment", "training"):
+            self.assertEqual({key: loaded[section][key] for key in payload[section]},
+                             payload[section])
         exported = json.loads(json.dumps(loaded))
         self.assertEqual(validate_settings_file(exported)["settings"], loaded)
 

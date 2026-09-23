@@ -23,6 +23,12 @@ ENV_VERSION = "autonomous_ppo_v6_daily_budget"
 
 # Keep the same web-visible configuration keys.  No HTML/UI changes are needed.
 ENV_DEFAULTS = dict(
+    # Causal minute history; one frame retains the legacy observation shape.
+    observation_history_bars=1,
+    random_start_enabled=False,
+    random_start_probability=0.5,
+    random_start_max_minutes=180,
+    end_inactive_episode_enabled=False,
     # Reference candidate engine
     reference_strategy_enabled=False,
     reference_features_enabled=True,
@@ -192,6 +198,10 @@ ENV_DEFAULTS = dict(
     terminal_win_min_points=10.0,
     terminal_loss_shaping_enabled=False,
     terminal_loss_penalty_r=0.05,
+    # Optional proportional downside aversion. A 1.15 multiplier adds a
+    # 0.15*abs(net R) penalty at close, bounded by the shared shaping cap.
+    loss_aversion_enabled=False,
+    loss_aversion_multiplier=1.15,
     exit_reason_shaping_enabled=False,
     option_target_bonus_r=0.03,
     structural_stop_penalty_r=0.08,
@@ -289,6 +299,7 @@ def validate_config(payload):
         cfg[key] = value
 
     probability_keys = (
+        "random_start_probability",
         "reference_ignition_min", "reference_direction_gap",
         "reference_exit_threshold", "tradeability_threshold",
         "min_path_efficiency", "underlying_target_min_fraction",
@@ -301,6 +312,7 @@ def validate_config(payload):
             raise ValueError(f"{key} must be in [0, 1]")
 
     positive_keys = (
+        "observation_history_bars",
         "reference_window", "reference_strike_spacing", "reference_structural_lookback",
         "reference_pivot_left", "reference_pivot_right", "atr_period",
         "risk_reward_target_r", "stop_atr_multiplier", "max_hold_minutes",
@@ -308,6 +320,7 @@ def validate_config(payload):
         "fixed_option_target_points", "fixed_option_stop_points",
         "max_structural_stop_atr",
         "daily_profit_target_points", "daily_loss_limit_points",
+        "loss_aversion_multiplier",
     )
     for key in positive_keys:
         if cfg[key] <= 0:
@@ -315,6 +328,8 @@ def validate_config(payload):
 
     if cfg["reference_window"] < 8:
         raise ValueError("reference_window must be >= 8")
+    if cfg["observation_history_bars"] > 32:
+        raise ValueError("observation_history_bars must be <= 32")
     if cfg["path_efficiency_window"] < 2:
         raise ValueError("path_efficiency_window must be >= 2")
     if cfg["reference_structural_lookback"] < cfg["reference_pivot_left"] + cfg["reference_pivot_right"] + 1:
@@ -329,6 +344,8 @@ def validate_config(payload):
         raise ValueError("stop_premium_pct and slippage_pct must be < 1")
     if cfg["max_shaping_r_per_trade"] > 0.25:
         raise ValueError("Keep shaping modest: max_shaping_r_per_trade <= 0.25R")
+    if cfg["loss_aversion_multiplier"] < 1:
+        raise ValueError("loss_aversion_multiplier must be >= 1")
 
     first = parse_clock(cfg["first_entry_time"], "first_entry_time")
     last = parse_clock(cfg["last_entry_time"], "last_entry_time")
@@ -391,7 +408,9 @@ class BankNiftyEnv(gym.Env):
         self.action_space = spaces.Discrete(5)
         self.observation_space = spaces.Box(
             -np.inf, np.inf,
-            shape=(len(self.feature_columns) + len(POSITION_FEATURES),),
+            shape=(len(self.feature_columns) * self.observation_history_bars
+                   + len(POSITION_FEATURES)
+                   + (self.observation_history_bars if self.observation_history_bars > 1 else 0),),
             dtype=np.float32,
         )
 
@@ -534,6 +553,22 @@ class BankNiftyEnv(gym.Env):
             self._prepare_underlying_context_only()
 
         self.step_idx = 0
+        # Randomise time exposure, not future profitability. Evaluation always
+        # starts at the beginning of the complete chronological session.
+        if (self.random_day and self.random_start_enabled
+                and self.np_random.random() < self.random_start_probability):
+            times = self.day_df.timestamp
+            eligible = (times <= times.iloc[0] + pd.Timedelta(minutes=self.random_start_max_minutes))
+            if self.last_entry_time_enabled:
+                eligible &= times.dt.time < self.last_entry_time
+            if self.square_off_enabled:
+                eligible &= times.dt.time < self.square_off_time
+            indices = np.flatnonzero(eligible.to_numpy())
+            indices = indices[indices < len(self.day_df) - 1]
+            if len(indices):
+                self.step_idx = int(self.np_random.choice(indices))
+        self.episode_start_time = str(self.day_df.timestamp.iloc[self.step_idx])
+        self.episode_partial_session = self.step_idx != 0
         self.episode_pnl = 0.0
         self.episode_reward = 0.0
         self._reward_value = 0.0
@@ -550,7 +585,38 @@ class BankNiftyEnv(gym.Env):
 
         if self.state:
             self.state.start_day(str(self.current_day), str(self.day_df.expiry.iloc[0].date()))
-        return self._get_observation(), {"date": str(self.current_day)}
+        return self._get_observation(), {
+            "date": str(self.current_day), "episode_start_time": self.episode_start_time,
+            "partial_session": self.episode_partial_session,
+        }
+
+    def _market_history(self):
+        """Oldest-to-newest completed minutes, padded across missing timestamps.
+
+        Never forward-fill a gap or use another day's/future rows. Flags describe
+        timestamp presence; individual feature availability remains in the data.
+        """
+        if self.observation_history_bars == 1:
+            return self.day_df.iloc[self.step_idx][self.feature_columns].to_numpy(
+                dtype=np.float32) * self._feature_enabled
+        past = self.day_df.iloc[:self.step_idx + 1]
+        clock = pd.date_range(end=past.timestamp.iloc[-1],
+                              periods=self.observation_history_bars, freq="min")
+        indices = pd.DatetimeIndex(past.timestamp).get_indexer(clock)
+        present = indices >= 0
+        frames = np.zeros((self.observation_history_bars, len(self.feature_columns)), np.float32)
+        frames[present] = past.iloc[indices[present]][self.feature_columns].to_numpy(dtype=np.float32)
+        frames *= self._feature_enabled
+        return np.concatenate((frames.ravel(), present.astype(np.float32)))
+
+    def _no_future_entries(self):
+        """Only known irreversible session restrictions justify early completion."""
+        if self.position is not None:
+            return False
+        clock = self.day_df.timestamp.iloc[self.step_idx].time()
+        return bool(self.daily_limit_reason
+                    or (self.last_entry_time_enabled and clock >= self.last_entry_time)
+                    or (self.square_off_enabled and clock >= self.square_off_time))
 
     def _prepare_underlying_context_only(self):
         prev = self.day_df.close.shift(1)
@@ -1198,7 +1264,7 @@ class BankNiftyEnv(gym.Env):
                     values[key] = 0.0
         obs = np.concatenate(
             [
-                row[self.feature_columns].to_numpy(dtype=np.float32) * self._feature_enabled,
+                self._market_history(),
                 np.array([values[k] for k in POSITION_FEATURES], dtype=np.float32),
             ]
         )
@@ -1550,9 +1616,17 @@ class BankNiftyEnv(gym.Env):
             terminal_shaping += self.terminal_win_bonus_r
         elif net_points < 0 and self.terminal_loss_shaping_enabled:
             terminal_shaping -= self.terminal_loss_penalty_r
+        shaping_capacity = max(0.0, self.max_shaping_r_per_trade - p["shaping_used"])
+        loss_aversion_penalty = 0.0
+        if net_points < 0 and self.loss_aversion_enabled:
+            loss_aversion_penalty = min(
+                (self.loss_aversion_multiplier - 1.0) * abs(net_points / risk),
+                shaping_capacity,
+            )
+            terminal_shaping -= loss_aversion_penalty
         terminal_shaping = float(np.sign(terminal_shaping) * min(
             abs(terminal_shaping),
-            max(0.0, self.max_shaping_r_per_trade - p["shaping_used"]),
+            shaping_capacity,
         ))
 
         record = dict(
@@ -1587,6 +1661,7 @@ class BankNiftyEnv(gym.Env):
             reward=net_points / risk - p["entry_penalty_r"] + p["shaping_r"] + terminal_shaping - p.get("agent_exit_penalty_paid", 0.0),
             agent_exit_penalty_r=p.get("agent_exit_penalty_paid", 0.0),
             terminal_shaping_r=terminal_shaping,
+            loss_aversion_penalty_r=loss_aversion_penalty,
             trade_quantity=self.trade_quantity, regime=p["regime"],
             underlying_target_points=p["underlying_target_points"],
         )
@@ -1797,6 +1872,8 @@ class BankNiftyEnv(gym.Env):
         self._terminated = self.step_idx == len(self.day_df) - 1
         self._manage_position(final=self._terminated)
         self._update_daily_limits()
+        if self.end_inactive_episode_enabled and self._no_future_entries():
+            self._terminated = True
 
         shaping = (
             self._shape_hold()
@@ -1820,6 +1897,12 @@ class BankNiftyEnv(gym.Env):
             date=str(self.current_day), episode_pnl=self.episode_pnl,
             episode_reward=self.episode_reward, trades=len(self.trade_log),
             action_name=semantic, invalid_action=invalid,
+            entry_available=bool(not was_holding and (masks[BUY_CE] or masks[BUY_PE])),
+            voluntary_wait=bool(not was_holding and action == WAIT and not invalid
+                                and (masks[BUY_CE] or masks[BUY_PE])),
+            entry_opened=bool(not was_holding and action in (BUY_CE, BUY_PE) and not rejected),
+            episode_start_time=self.episode_start_time,
+            partial_session=self.episode_partial_session,
             entry_rejected=rejected, pnl_reward_r=pnl_delta,
             entry_penalty_r=self._entry_penalty,
             shaping_reward_r=shaping,

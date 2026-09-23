@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import random
 import shutil
 import tempfile
 import threading
@@ -11,6 +12,7 @@ import time
 import traceback
 import zipfile
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import torch as th
@@ -58,6 +60,9 @@ TRAIN_DEFAULTS = dict(
     total_timesteps=1000000, learning_rate=0.0003, n_steps=2048, batch_size=512, n_epochs=5,
     gamma=0.995, gae_lambda=0.95, clip_range=0.20, ent_coef=0.01, vf_coef=0.5,
     max_grad_norm=0.5, seed=42,
+    adaptive_entropy_enabled=False, entropy_final_coef=0.005, entropy_max_coef=0.06,
+    wait_collapse_threshold=0.90, wait_monitor_min_decisions=128,
+    validation_interval_steps=0, profit_first_selection_enabled=False,
     multi_seed_enabled=False, num_seeds=3, seed_stride=17,
     normalize_obs_enabled=True, normalize_reward_enabled=True, clip_obs=10.0, clip_reward=10.0,
     cuda_enabled=True, checkpoint_enabled=True, checkpoint_freq=100000,
@@ -220,6 +225,11 @@ def validation_selection_score(metrics, training_cfg=None):
 
 
 def validation_candidate_key(candidate, training_cfg):
+    if training_cfg.get("profit_first_selection_enabled", False):
+        checks = candidate["targets"]["checks"]
+        eligible = checks["evaluation_complete"] and checks["enough_trades"] and checks["trades_per_day"]
+        profitable = eligible and checks["profit_factor"] and checks["average_r"]
+        return candidate["targets"]["targets_met"], profitable, eligible, candidate["score"]
     # Preserve the old fallback order unless the frequency minimum is enabled.
     checks = candidate["targets"]["checks"]
     eligible = (checks["enough_trades"] and checks["trades_per_day"]
@@ -508,13 +518,31 @@ def make_market_env(env_cfg, split="train", state=None, random_day=True, model_i
     )
 
 
+def exploration_feedback(cfg, progress, available, waits, entries):
+    """Adapt PPO entropy, not actions or P&L; forced WAIT is excluded."""
+    base = cfg["ent_coef"] + np.clip(progress, 0.0, 1.0) * (cfg["entropy_final_coef"] - cfg["ent_coef"])
+    wait_fraction = waits / available if available else None
+    collapse = available >= cfg["wait_monitor_min_decisions"] and wait_fraction >= cfg["wait_collapse_threshold"]
+    coef = min(cfg["entropy_max_coef"], max(base, cfg["ent_coef"] * 2.0)) if collapse else base
+    return dict(entropy_coefficient=float(coef), eligible_entry_decisions=int(available),
+                voluntary_wait_fraction=wait_fraction, entries_opened=int(entries),
+                wait_collapse_warning=bool(collapse))
+
+
 class LiveCallback(BaseCallback):
-    def __init__(self, state, base_steps=0, total_target=None):
+    def __init__(self, state, base_steps=0, total_target=None, training_cfg=None,
+                 seed_target=None, validate_checkpoint=None):
         super().__init__()
         self.state = state
         self.t0 = None
         self.base_steps = int(base_steps)
         self.total_target = total_target
+        self.cfg = training_cfg or TRAIN_DEFAULTS
+        self.seed_target = seed_target or total_target or 1
+        self.validate_checkpoint = validate_checkpoint
+        self._last_validation = 0
+        self._available = self._waits = self._entries = 0
+        self._feedback = {}
 
     def _on_training_start(self):
         self.t0 = time.time()
@@ -534,15 +562,44 @@ class LiveCallback(BaseCallback):
         infos = self.locals.get("infos", [])
         dones = self.locals.get("dones", [])
         for info, done in zip(infos, dones):
+            self._available += int(info.get("entry_available", False))
+            self._waits += int(info.get("voluntary_wait", False))
+            self._entries += int(info.get("entry_opened", False))
             if done:
                 self.state.episode(float(info.get("episode_reward", 0.0)))
+                with self.state.lock:
+                    self.state.evaluation["last_training_episode"] = dict(
+                        start=info.get("episode_start_time"),
+                        partial_session=bool(info.get("partial_session", False)),
+                    )
         return not stop
 
     def _on_rollout_start(self):
+        # At this point the preceding rollout has actually been trained. Saving
+        # at rollout-end would evaluate the OLD policy against newer statistics.
+        interval = self.cfg["validation_interval_steps"]
+        if (self.validate_checkpoint is not None and interval > 0
+                and self.num_timesteps - self._last_validation >= interval):
+            self.validate_checkpoint(self.model, self.training_env, int(self.num_timesteps))
+            self._last_validation = int(self.num_timesteps)
+        self._available = self._waits = self._entries = 0
         # DQN rollouts may be only four steps. Avoid logging/locking every rollout.
         if self.num_timesteps - getattr(self, "_last_capture", -256) >= 256:
             self._capture_optimizer()
             self._last_capture = self.num_timesteps
+
+    def _on_rollout_end(self):
+        if (self.cfg["adaptive_entropy_enabled"]
+                and getattr(self.model, "market_algorithm", "ppo") == "ppo"):
+            self._feedback = exploration_feedback(
+                self.cfg, self.num_timesteps / self.seed_target,
+                self._available, self._waits, self._entries,
+            )
+            self.model.ent_coef = self._feedback["entropy_coefficient"]
+            for key, value in self._feedback.items():
+                if value is not None:
+                    self.model.logger.record("exploration/" + key, float(value))
+            self._capture_optimizer()
 
     def _on_training_end(self):
         self._capture_optimizer()
@@ -553,6 +610,7 @@ class LiveCallback(BaseCallback):
                 key: float(value) for key, value in self.model.logger.name_to_value.items()
                 if key.startswith("train/") and np.isscalar(value) and np.isfinite(value)
             }
+            self.state.optimizer.update({"exploration/" + k: v for k, v in self._feedback.items()})
             self.state.policy_device = str(next(self.model.policy.parameters()).device)
             if self.model.device.type == "cuda":
                 self.state.gpu_memory_mb = th.cuda.memory_allocated(self.model.device) / (1024**2)
@@ -601,6 +659,7 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
     daily_results = []
     candidate_days = []
     finished_days = 0
+    available_decisions = voluntary_waits = opened_entries = 0
     if state is not None and progress:
         with state.lock:
             state.target = len(raw_env.days)
@@ -634,7 +693,10 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
                 else:
                     action = _policy_action(model, vec, raw_env, obs)
 
-                obs, _, terminated, truncated, _ = raw_env.step(action)
+                obs, _, terminated, truncated, info = raw_env.step(action)
+                available_decisions += int(info.get("entry_available", False))
+                voluntary_waits += int(info.get("voluntary_wait", False))
+                opened_entries += int(info.get("entry_opened", False))
                 if terminated or truncated:
                     break
 
@@ -662,6 +724,10 @@ def evaluate_saved_policy(model_path, vec_path, env_cfg, split="validation",
         metrics = summarize_trades(all_trades, finished_days)
         daily_points = [d["net_points"] for d in daily_results]
         metrics.update(daily_net_points=daily_points,
+                       eligible_entry_decisions=available_decisions,
+                       voluntary_wait_fraction=voluntary_waits / available_decisions if available_decisions else None,
+                       entries_opened=opened_entries,
+                       no_entry_warning=opened_entries == 0,
                        worst_day_points=min(daily_points) if daily_points else None,
                        best_day_points=max(daily_points) if daily_points else None,
                        profitable_days_pct=100 * sum(p > 0 for p in daily_points) / len(daily_points) if daily_points else 0.0,
@@ -691,6 +757,65 @@ def reference_benchmark(env_cfg, split, enabled, check_cancel=None):
                                    split=split, reference_only=True, check_cancel=check_cancel)
     result["enabled"] = True
     return result
+
+
+@contextmanager
+def preserve_training_rng():
+    """Loading an evaluation model must not reseed the live training policy."""
+    python_rng, numpy_rng = random.getstate(), np.random.get_state()
+    try:
+        devices = list(range(th.cuda.device_count())) if th.cuda.is_available() else []
+        with th.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+
+
+def validate_training_candidate(candidate_model, candidate_vec, cfg, data_meta,
+                                run_id, seed, steps, intermediate=False):
+    """Evaluate saved weights + matching frozen normalizer, never the live env."""
+    check_training_stop()
+    with STATE.lock:
+        STATE.status = "validating"
+    EVAL_STATE.reset(1)
+    EVAL_STATE.status = "validating"
+    EVAL_STATE.begin_log(f"validation_{run_id}")
+    EVAL_STATE.evaluation = dict(split="validation", seed=seed, steps=steps,
+                                 automatic=True, intermediate=intermediate)
+    try:
+        with preserve_training_rng():
+            validation = evaluate_saved_policy(
+                candidate_model.with_suffix(".zip"), candidate_vec,
+                cfg["environment"], split="validation", state=EVAL_STATE, progress=True,
+                reference_only=False, check_cancel=check_training_stop,
+            )
+        targets = validation_target_results(validation["metrics"], cfg, complete=not validation["partial"])
+        with EVAL_STATE.lock:
+            EVAL_STATE.status = "stopped" if validation["partial"] else "completed"
+            EVAL_STATE.evaluation.update(
+                dataset_id=data_meta["dataset_id"], partial=validation["partial"],
+                trading_metrics=validation["metrics"], targets=targets,
+                completed_days=validation["finished_days"], total_days=validation["total_days"],
+            )
+            Path(EVAL_STATE.log_path).with_suffix(".json").write_text(
+                json.dumps(EVAL_STATE.snapshot(), indent=2), encoding="utf-8")
+        if validation["partial"]:
+            raise TrainingStopped()
+        candidate = dict(seed=seed, steps=steps, intermediate=intermediate,
+                         model=str(candidate_model.with_suffix(".zip")), vec=str(candidate_vec),
+                         validation=validation, targets=targets,
+                         score=validation_selection_score(validation["metrics"], cfg))
+        with STATE.lock:
+            STATE.evaluation["seed_results"].append(dict(
+                seed=seed, steps=steps, intermediate=intermediate, score=candidate["score"],
+                validation_metrics=validation["metrics"],
+                candidate_diagnostics=validation["candidate_diagnostics"],
+                regime_breakdown=validation["regimes"], targets=targets,
+            ))
+        return candidate
+    finally:
+        EVAL_STATE.close_log()
 
 
 def training_worker(cfg):
@@ -725,7 +850,9 @@ def training_worker(cfg):
                 "multi_seed": cfg["multi_seed_enabled"],
                 "seeds": seeds,
                 "steps_per_seed": per_seed,
-                "selection_metric": "average_R + 0.10*log(PF) - drawdown penalty",
+                "selection_metric": ("targets, PF/expectancy/sample/frequency eligibility, then net-R/PF/drawdown score"
+                                     if cfg["profit_first_selection_enabled"] else
+                                     "average_R + 0.10*log(PF) - drawdown penalty"),
                 "seed_results": [],
             }
 
@@ -795,7 +922,24 @@ def training_worker(cfg):
             model.market_training_seed = seed
             model.market_training_config = {k: v for k, v in cfg.items() if k != "environment"}
 
-            callback_items = [LiveCallback(STATE, base_steps=base_steps, total_target=total_actual)]
+            def validate_checkpoint(live_model, live_env, steps):
+                check_training_stop()
+                checkpoint_id = f"{run_id}_step{steps}"
+                candidate_model, candidate_vec = save_training_model(
+                    live_model, live_env, cfg, checkpoint_id, seed,
+                )
+                candidates.append(validate_training_candidate(
+                    candidate_model, candidate_vec, cfg, data_meta,
+                    checkpoint_id, seed, steps, intermediate=True,
+                ))
+                with STATE.lock:
+                    STATE.status = "stopping" if STATE.stop else "training"
+                check_training_stop()
+
+            callback_items = [LiveCallback(
+                STATE, base_steps=base_steps, total_target=total_actual,
+                training_cfg=cfg, seed_target=per_seed, validate_checkpoint=validate_checkpoint,
+            )]
             if cfg["checkpoint_enabled"]:
                 callback_items.append(CheckpointCallback(
                     save_freq=max(1000, min(int(cfg["checkpoint_freq"]), per_seed)),
@@ -820,51 +964,10 @@ def training_worker(cfg):
             current_env.close()
             current_env = None
 
-            check_training_stop()
-            with STATE.lock:
-                STATE.status = "stopping" if STATE.stop else "validating"
-
-            EVAL_STATE.reset(1)
-            EVAL_STATE.status = "validating"
-            EVAL_STATE.begin_log(f"validation_{run_id}")
-            EVAL_STATE.evaluation = dict(split="validation", seed=seed, automatic=True)
-            validation = evaluate_saved_policy(
-                candidate_model.with_suffix(".zip"), candidate_vec,
-                cfg["environment"], split="validation", state=EVAL_STATE, progress=True,
-                reference_only=False, check_cancel=check_training_stop
-            )
-            EVAL_STATE.close_log()
-            with EVAL_STATE.lock:
-                EVAL_STATE.status = "stopped" if validation["partial"] else "completed"
-                EVAL_STATE.evaluation.update(
-                    dataset_id=data_meta["dataset_id"], partial=validation["partial"],
-                    trading_metrics=validation["metrics"],
-                    targets=validation_target_results(validation["metrics"], cfg, complete=not validation["partial"]),
-                    completed_days=validation["finished_days"], total_days=validation["total_days"],
-                )
-                Path(EVAL_STATE.log_path).with_suffix(".json").write_text(
-                    json.dumps(EVAL_STATE.snapshot(), indent=2), encoding="utf-8")
-            if validation["partial"]:
-                raise TrainingStopped()
-            score = validation_selection_score(validation["metrics"], cfg)
-            candidates.append(dict(
-                seed=seed,
-                model=str(candidate_model.with_suffix(".zip")),
-                vec=str(candidate_vec),
-                validation=validation,
-                score=score,
-                targets=validation_target_results(validation["metrics"], cfg),
+            candidates.append(validate_training_candidate(
+                candidate_model, candidate_vec, cfg, data_meta,
+                run_id, seed, int(model.num_timesteps),
             ))
-
-            with STATE.lock:
-                STATE.evaluation["seed_results"].append(dict(
-                    seed=seed,
-                    score=score,
-                    validation_metrics=validation["metrics"],
-                    candidate_diagnostics=validation["candidate_diagnostics"],
-                    regime_breakdown=validation["regimes"],
-                    targets=validation_target_results(validation["metrics"], cfg),
-                ))
 
             base_steps += int(model.num_timesteps)
 
@@ -874,6 +977,12 @@ def training_worker(cfg):
         # Prefer all targets, then the enabled frequency/sample requirements,
         # then score. A fallback still reports every unmet target explicitly.
         best = max(candidates, key=lambda x: validation_candidate_key(x, cfg))
+        selection_warning = None
+        if not best["targets"]["targets_met"]:
+            failed = [name for name, passed in best["targets"]["checks"].items() if not passed]
+            selection_warning = ("Research fallback only: no evaluated checkpoint met all targets. "
+                                 "Selected checkpoint failed: " + ", ".join(failed)
+                                 + ". Do not treat this as a validated profitable strategy.")
 
         # Reference-only benchmark on the same validation split/config.
         reference = reference_benchmark(
@@ -900,11 +1009,15 @@ def training_worker(cfg):
             "multi_seed_offsets": list(MULTI_SEED_OFFSETS),
             "steps_per_seed": per_seed,
             "selected_seed": best["seed"],
+            "selected_steps": best["steps"],
             "selected_score": best["score"],
             "selected_targets": best["targets"],
+            "selection_warning": selection_warning,
             "seed_results": [
                 {
                     "seed": c["seed"],
+                    "steps": c["steps"],
+                    "intermediate": c["intermediate"],
                     "score": c["score"],
                     "validation_metrics": c["validation"]["metrics"],
                     "targets": c["targets"],
@@ -931,8 +1044,10 @@ def training_worker(cfg):
             STATE.progress = 100.0 if not STATE.stop else STATE.progress
             STATE.evaluation.update(
                 selected_seed=best["seed"],
+                selected_steps=best["steps"],
                 selected_validation_score=best["score"],
                 selected_targets=best["targets"],
+                selection_warning=selection_warning,
                 selected_validation_metrics=best["validation"]["metrics"],
                 selected_candidate_diagnostics=best["validation"]["candidate_diagnostics"],
                 selected_regime_breakdown=best["validation"]["regimes"],
@@ -1144,6 +1259,8 @@ path_efficiency_window:'Path-efficiency window (completed bars)',
 terminal_win_min_points:'Minimum net option points for win bonus (after costs)',
 terminal_win_bonus_r:'Win bonus R (within total shaping cap)',
 terminal_loss_penalty_r:'Loss penalty R (within total shaping cap)',
+loss_aversion_enabled:'Enable proportional loss aversion',
+loss_aversion_multiplier:'Loss reward multiplier (1.15 = 15% extra, capped)',
 giveback_min_mfe_r:'Minimum peak profit R before giveback penalty',
 giveback_penalty_enabled:'Enable profit-giveback penalty (independent of HOLD bonus)',
 learned_exit_enabled:'Let PPO choose EXIT after minimum hold',
@@ -1185,6 +1302,8 @@ momentum_decay_loss_penalty_r:'Losing momentum-decay extra penalty R'
 ints.add('path_efficiency_window');ints.add('min_validation_trades');['target_exit_cooldown_minutes','structural_stop_cooldown_minutes','losing_exit_cooldown_minutes'].forEach(k=>ints.add(k));
 Object.assign(labels,{reference_strategy_enabled:'Restrict entries to reference signals (OFF = PPO chooses both sides)',reference_features_enabled:'Include advisory reference calculations',missing_filter_values_pass:'Optional liquidity/indicator gates permit missing values',missingness_features_enabled:'Show indicator availability flags',disabled_features:'Disabled feature names (comma separated)',nse_option_txn_rate:'Exchange fee rate (turnover fraction)',option_stt_sell_rate:'STT sell rate (turnover fraction)'});
 Object.assign(labels,{daily_profit_limit_enabled:'Stop entries after daily profit target',daily_profit_target_points:'Daily NET profit target (option points)',daily_loss_limit_enabled:'Stop entries after daily loss budget',daily_loss_limit_points:'Daily NET loss budget (positive option points)',close_on_daily_limit_enabled:'Include open P&L and request exit on daily limit (next available open)'});
+['observation_history_bars','random_start_max_minutes','validation_interval_steps','wait_monitor_min_decisions'].forEach(k=>ints.add(k));
+Object.assign(labels,{observation_history_bars:'Observation history (completed minutes; new model required)',random_start_enabled:'Vary training episode start times (never evaluation)',random_start_probability:'Fraction of training episodes with sampled starts',random_start_max_minutes:'Maximum start offset from session open (minutes)',end_inactive_episode_enabled:'End flat session after irreversible entry cutoff'});
 renderFields('envfields','cfg_',defaults,labels);
 const trainLabels={target_win_rate_pct:'Validation target win rate %',target_profit_factor:'Validation target profit factor',target_average_r:'Validation target average R',multi_seed_enabled:'Enable multi-seed training',num_seeds:'Number of seeds',seed_stride:'Seed stride',normalize_obs_enabled:'Normalize observations',normalize_reward_enabled:'Normalize rewards',cuda_enabled:'Enable CUDA',checkpoint_enabled:'Enable checkpoints'};
 trainLabels.min_validation_trades='Minimum validation trades for target assessment';
@@ -1194,10 +1313,11 @@ Object.assign(trainLabels,{cuda_enabled:'Require CUDA for training (OFF = CPU)',
 Object.assign(trainLabels,{daily_targets_enabled:'Require daily objectives in validation assessment',target_daily_points:'Validation daily NET points target',target_daily_hit_rate_pct:'Required % of evaluated days meeting daily target',max_daily_loss_points:'Validation maximum daily loss budget (positive points)'});
 ['dqn_buffer_size','dqn_learning_starts','dqn_train_freq','dqn_gradient_steps','dqn_target_update_interval'].forEach(k=>ints.add(k));
 Object.assign(trainLabels,{algorithm:'Training algorithm',dqn_double_enabled:'DQN: use Double DQN targets',dqn_buffer_size:'DQN: replay capacity (transitions, uses RAM)',dqn_learning_starts:'DQN: valid-action warmup steps',dqn_train_freq:'DQN: collect steps per update',dqn_gradient_steps:'DQN: gradient updates per collection',dqn_target_update_interval:'DQN: target network update interval (steps)',dqn_tau:'DQN: target update fraction',dqn_exploration_fraction:'DQN: fraction of run for epsilon decay',dqn_initial_epsilon:'DQN: initial random-action probability',dqn_final_epsilon:'DQN: final random-action probability'});
+Object.assign(trainLabels,{adaptive_entropy_enabled:'PPO: adaptive exploration for excessive voluntary WAIT',entropy_final_coef:'PPO: final base entropy coefficient',entropy_max_coef:'PPO: maximum adaptive entropy coefficient',wait_collapse_threshold:'PPO: voluntary WAIT fraction triggering exploration',wait_monitor_min_decisions:'PPO: minimum eligible decisions per rollout for WAIT warning',validation_interval_steps:'Evaluate checkpoints every N steps per seed (0 = final only)',profit_first_selection_enabled:'Prefer PF/expectancy-qualified active validation models'});
 renderFields('trainfields','tr_',trainDefaults,trainLabels);
 document.getElementById('tr_target_average_r').removeAttribute('min');
 const tuningHelp=document.createElement('p');tuningHelp.className='muted';
-tuningHelp.textContent='CUDA checks actual GPU execution. Steps are shared across seeds. DQN uses replay/epsilon controls and pi layer widths for its Q-network; PPO-only rollout, GAE, entropy, clipping, epochs, KL and vf layer controls are ignored by DQN. DQN-only fields are ignored by PPO. Each seed is saved before validation. Neither algorithm guarantees profitability.';
+tuningHelp.textContent='CUDA checks actual GPU execution. Steps are shared across seeds. DQN uses replay/epsilon controls and pi layer widths for its Q-network; PPO-only rollout, GAE, entropy, clipping, epochs, KL and vf layer controls are ignored by DQN. DQN-only fields are ignored by PPO. Periodic validation pauses training and evaluates a saved policy with frozen normalization on CPU. Sampled training episodes can be partial sessions: their per-day cards are NOT full-day income estimates. Use full-day validation/test. Adaptive exploration does not force trades or guarantee profitability. Test data is never used for checkpoint selection.';
 document.getElementById('trainfields').after(tuningHelp);
 for(const key of ['supervised_iterations','supervised_max_leaf_nodes','supervised_min_samples_leaf','ppo_timesteps','ppo_n_steps','ppo_batch_size','ppo_n_epochs'])ints.add(key);
 renderFields('candidatefields','cand_',candidateDefaults,{
@@ -1357,6 +1477,15 @@ def parse_training_config(p):
         raise ValueError("Normalization clips and checkpoint frequency must be positive")
     if min(cfg["ent_coef"], cfg["vf_coef"], cfg["seed"], cfg["seed_stride"]) < 0:
         raise ValueError("Entropy/value coefficients and seeds must be nonnegative")
+    if cfg["validation_interval_steps"] < 0 or cfg["wait_monitor_min_decisions"] < 1:
+        raise ValueError("Validation interval must be >= 0; wait monitor decisions must be >= 1")
+    if not 0 < cfg["wait_collapse_threshold"] <= 1:
+        raise ValueError("wait_collapse_threshold must be in (0, 1]")
+    if min(cfg["entropy_final_coef"], cfg["entropy_max_coef"]) < 0:
+        raise ValueError("Entropy schedule coefficients must be nonnegative")
+    if cfg["adaptive_entropy_enabled"] and (
+            cfg["ent_coef"] <= 0 or cfg["entropy_max_coef"] < max(cfg["ent_coef"], cfg["entropy_final_coef"])):
+        raise ValueError("Adaptive entropy needs positive ent_coef and a cap >= both schedule endpoints")
     if cfg["target_win_rate_pct"] > 100:
         raise ValueError("target_win_rate_pct must be <= 100")
     if cfg["target_win_rate_pct"] < 0 or cfg["target_profit_factor"] <= 0:

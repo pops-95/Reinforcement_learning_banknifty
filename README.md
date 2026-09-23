@@ -1,5 +1,10 @@
 # Autonomous BANKNIFTY PPO
 
+For the opportunity-learning update, see [PPO_OPPORTUNITY.md](PPO_OPPORTUNITY.md)
+and load `settings/banknifty_ppo_opportunity_v3.json`. It adds causal minute
+history, time-diverse training starts, adaptive PPO exploration and intermediate
+validation selection. It requires fresh training; performance is unverified.
+
 PPO and masked DQN now share the website. See [DQN_TRADING.md](DQN_TRADING.md)
 for the DQN implementation, user-run checks and CLI commands. The new
 `settings/banknifty_dqn_trade_quality.json` and

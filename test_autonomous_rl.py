@@ -186,6 +186,32 @@ class AutonomousTests(unittest.TestCase):
         self.assertLess(env._daily_net_points(), 40.)
         self.assertEqual(env.daily_limit_reason, "")
 
+    def test_loss_aversion_is_proportional_capped_and_does_not_reward_wait(self):
+        env = self.env(loss_aversion_enabled=True, loss_aversion_multiplier=1.15,
+                       max_shaping_r_per_trade=.10, fixed_option_stop_enabled=True,
+                       fixed_option_stop_points=20.)
+        _, wait_reward, _, _, _ = env.step(WAIT)
+        self.assertEqual(wait_reward, 0.)
+        env.step(BUY_CE)
+        key = ("CE", env.day_df.timestamp.iloc[3])
+        env.option_lookup[key] = env.option_lookup[key]._replace(open=90.)
+        _, reward, _, _, _ = env.step(EXIT)
+        trade = env.trade_log[-1]
+        self.assertAlmostEqual(trade["R_return"], -.5)
+        self.assertAlmostEqual(trade["loss_aversion_penalty_r"], .075)
+        self.assertAlmostEqual(trade["terminal_shaping_r"], -.075)
+        self.assertAlmostEqual(trade["reward"], -.575)
+        self.assertAlmostEqual(reward, -.575)
+
+        env = self.env(loss_aversion_enabled=True, loss_aversion_multiplier=2.,
+                       max_shaping_r_per_trade=.10)
+        env.step(BUY_CE)
+        key = ("CE", env.day_df.timestamp.iloc[2])
+        env.option_lookup[key] = env.option_lookup[key]._replace(open=60.)
+        env.step(EXIT)
+        self.assertAlmostEqual(env.trade_log[-1]["loss_aversion_penalty_r"], .10)
+        self.assertAlmostEqual(env.trade_log[-1]["terminal_shaping_r"], -.10)
+
 
 class DataTests(unittest.TestCase):
     def test_missing_oi_not_forward_filled_and_returns_do_not_cross_gaps(self):
@@ -270,7 +296,8 @@ class WebConfigurationTests(unittest.TestCase):
         payload = json.loads(path.read_text())
         response = web.app.test_client().post("/api/settings/validate", json=payload)
         self.assertEqual(response.status_code, 200, response.json)
-        self.assertEqual(set(payload["environment"]), set(web.ENV_DEFAULTS))
+        self.assertTrue(set(payload["environment"]).issubset(web.ENV_DEFAULTS))
+        self.assertEqual(set(response.json["settings"]["environment"]), set(web.ENV_DEFAULTS))
         # Older exports acquire new algorithm/DQN defaults without losing values.
         self.assertTrue(set(payload["training"]).issubset(web.TRAIN_DEFAULTS))
         self.assertTrue(response.json["settings"]["training"]["daily_targets_enabled"])
